@@ -15,20 +15,20 @@ MEM_SIZE = 0x4d000000
 # --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
-HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
+HIGH_PHYS_BASE = 0x880000000
+HIGH_MEM_SIZE = 0x17ec00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
-GICD, GICD_SIZE = 0x17a00000, 0x10000
-GICR, GICR_SIZE = 0x17a60000, 0x100000
-FB, FB_SIZE = 0x9c000000, 0x1700000
+GICD, GICD_SIZE = 0x10200000, 0x10000
+GICR, GICR_SIZE = 0x10240000, 0x200000
+FB, FB_SIZE = 0xf6200000, 0x9a4000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
-UFS, UFS_SIZE = 0x01d84000, 0x3000
-TIMEBASE = 19200000
-VTIMER_INTID = 19
+UFS, UFS_SIZE = 0x11100000, 0x200
+TIMEBASE = 25600000
+VTIMER_INTID = 27
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
@@ -217,7 +217,7 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('samsung,g0s') + cstr('exynos2200') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
