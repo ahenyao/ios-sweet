@@ -111,7 +111,9 @@ def build(seed=None, qemu=False, highmem=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ], [node('memory-map', [ph()], [
+        node('PanicRegion', [ph(), ('reg', u64(phys_base + mem_size - 0x200000, 0x200000))])
+    ]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
@@ -145,8 +147,12 @@ def build(seed=None, qemu=False, highmem=False):
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
-    cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
-                         ('#size-cells', u32(0))], cpu_nodes)
+    cpus = node('cpus', [
+    	ph(),
+    	('#address-cells', u32(1)),
+    	('#size-cells', u32(0)),
+    	('timebase-frequency', u32(26000000)),
+	], cpu_nodes)
 
     gic = node('gic', [
         ph(),
@@ -156,28 +162,22 @@ def build(seed=None, qemu=False, highmem=False):
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
     arm_io = node('arm-io', [
-        ph(),
-        ('device_type', cstr('sweet-io')),
-        ('compatible', cstr('sweet-io') + cstr('arm-io')),
-        ('#address-cells', u32(2)),
-        ('#size-cells', u32(2)),
-        ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
-    ], [gic,
-        # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
-        # otherwise crashes trying to set the PMU boot stage (customer builds
-        # ignore the -wdt_no_pmu boot-arg).
-        node('wdt', [ph(), ('no-pmu', u32(1))]),
-        # Main display: IOMobileFramebuffer.framework counts /arm-io children
-        # with this device_type and reads the canvas size from the node
-        # (the presented iPhone X size, see SweetFramebuffer.cpp);
-        # the kernel's AppleCLCD matches the compatible string.
-        node('disp0', [
-            ph(),
-            ('device_type', cstr('display-subsystem')),
-            ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
-        ])])
+		ph(),
+		('device_type', cstr('sweet-io')),
+		('compatible', cstr('sweet-io') + cstr('arm-io')),
+		('#address-cells', u32(2)),
+		('#size-cells', u32(2)),
+		('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+	], [gic,
+		node('wdt', [ph(), ('no-pmu', u32(1))]),
+		node('disp0', [
+		    ph(),
+		    ('device_type', cstr('display-subsystem')),
+		    ('compatible', cstr('sweet,display')),
+		    ('canvas-width', u32(1125)),
+		    ('canvas-height', u32(2436)),
+		])
+	])
 
     fbcon = node('sweet-fbcon', [
         ph(),
@@ -189,10 +189,10 @@ def build(seed=None, qemu=False, highmem=False):
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
-        ph(),
-        ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
-    ])
+		ph(),
+		('compatible', cstr('qcom,ufshc')),
+		('reg', u64(UFS, UFS_SIZE)),
+	])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -216,15 +216,15 @@ def build(seed=None, qemu=False, highmem=False):
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
-        ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('samsung,g0s') + cstr('exynos2200') + cstr('AppleARM')),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
-        ('manufacturer', cstr('Apple Inc.')),
-        ('#address-cells', u32(2)),
-        ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+		ph(),
+		('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('samsung,g0s') + cstr('exynos2200') + cstr('AppleARM')),
+		('model', cstr('iPhone10,3')),
+		('target-type', cstr('D22')),
+		('target-sub-type', cstr('D22AP')),
+		('manufacturer', cstr('Apple Inc.')),
+		('#address-cells', u32(2)),
+		('#size-cells', u32(2)),
+	], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
