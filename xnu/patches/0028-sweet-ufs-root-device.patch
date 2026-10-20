@@ -536,7 +536,7 @@ new file mode 100644
 +	su.secsize = DEV_BSIZE;
 +
 +	lck_mtx_lock(&sweet_ufs_lock);
-+		int error = ENXIO;
++		error = ENXIO;
 +		for (int l = 0; l <= 4; l++) {
 +			su.lun = l;
 +			int err = ufs_take_over_host();
