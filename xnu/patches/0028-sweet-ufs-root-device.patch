@@ -226,7 +226,7 @@ new file mode 100644
 +	}
 +
 +	uint32_t ocs = utrd->dw2 & 0xff;
-+	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] ||(scsi_status && !(cdb[0] == 0x00 && scsi_status == 0x2))) {
 +		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
 +		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
 +		return EIO;
