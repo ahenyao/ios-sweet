@@ -535,7 +535,7 @@ new file mode 100644
 +	su.lun = 0;
 +	su.secsize = DEV_BSIZE;
 +
-+	lck_mtx_lock(&sweet_ufs_lock);
++		lck_mtx_lock(&sweet_ufs_lock);
 +		error = ENXIO;
 +		for (int l = 0; l <= 4; l++) {
 +			su.lun = l;
@@ -543,17 +543,11 @@ new file mode 100644
 +			if (err) {
 +				continue;
 +			}
-+			static const uint8_t tur[6] = { 0x00 };
 +			static const uint8_t req_sense[6] = { 0x03, 0, 0, 0, 18, 0 };
 +			static const uint8_t start_lun[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
 +			(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
 +			(void)ufs_scsi(start_lun, sizeof(start_lun), 0);
-+			for (int i = 0; i < 3 && (err = ufs_scsi(tur, sizeof(tur), 0)); i++) {
-+				(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
-+			}
-+			if (err) {
-+				continue;
-+			}
++			
 +			err = ufs_find_partition(want);
 +			if (!err) {
 +				error = 0;
@@ -564,6 +558,12 @@ new file mode 100644
 +		lck_mtx_unlock(&sweet_ufs_lock);
 +		if (error) {
 +			return error;
++
++
++
++
++
++
 +		}
 +
 +	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
