@@ -279,6 +279,7 @@ new file mode 100644
 +		const uint8_t *e = b + i * esz;
 +		char name[37];
 +		unsigned c;
++		uint64_t first, last;
 +		for (c = 0; c < 36; c++) {
 +			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
 +			if (ch == 0 || ch > 0x7f) {
@@ -295,7 +296,6 @@ new file mode 100644
 +		if (strcmp(name, want) != 0) {
 +			continue;
 +		}
-+		uint64_t first, last;
 +		memcpy(&first, e + 32, 8);
 +		memcpy(&last, e + 40, 8);
 +		if (last < first) {
