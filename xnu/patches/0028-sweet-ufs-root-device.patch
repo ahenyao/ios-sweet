@@ -41,7 +41,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_ufs.c
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,565 @@
 +/*
 + * SWEET internal UFS root device (read-only).
 + *
@@ -537,33 +537,41 @@ new file mode 100644
 +
 +		lck_mtx_lock(&sweet_ufs_lock);
 +		error = ENXIO;
-+		for (int l = 0; l <= 4; l++) {
-+			su.lun = l;
-+			int err = ufs_take_over_host();
-+			if (err) {
-+				continue;
-+			}
++		
++		int err = ufs_take_over_host();
++		if (!err) {
 +			static const uint8_t req_sense[6] = { 0x03, 0, 0, 0, 18, 0 };
++			static const uint8_t start_dev[6] = { 0x1b, 0, 0, 0, 0x11, 0 };
 +			static const uint8_t start_lun[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
++			static const uint8_t tur[6] = { 0x00 };
++	
++			/* Wake up the entire UFS device first */
++			su.lun = 0xd0;
 +			(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
-+			(void)ufs_scsi(start_lun, sizeof(start_lun), 0);
-+			
-+			err = ufs_find_partition(want);
-+			if (!err) {
-+				error = 0;
-+				printf("SWEET UFS: found partition \"%s\" on LUN %u\n", want, su.lun);
-+				break;
++			(void)ufs_scsi(start_dev, sizeof(start_dev), 0);
++	
++			/* Scan LUNs 0-4 for the target partition */
++			for (int l = 0; l <= 4; l++) {
++				su.lun = l;
++				(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
++				(void)ufs_scsi(start_lun, sizeof(start_lun), 0);
++				
++				/* Clear Unit Attention and wait for Ready */
++				for (int i = 0; i < 3 && (err = ufs_scsi(tur, sizeof(tur), 0)); i++) {
++					(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
++				}
++				
++				err = ufs_find_partition(want);
++				if (!err) {
++					error = 0;
++					printf("SWEET UFS: found partition \"%s\" on LUN %u\n", want, su.lun);
++					break;
++				}
 +			}
 +		}
 +		lck_mtx_unlock(&sweet_ufs_lock);
 +		if (error) {
 +			return error;
-+
-+
-+
-+
-+
-+
 +		}
 +
 +	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
