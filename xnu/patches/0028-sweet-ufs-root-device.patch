@@ -289,7 +289,7 @@ new file mode 100644
 +		}
 +		name[c] = 0;
 +
-+		if(name[0] {
++		if(name[0]) {
 +			printf("SWEET UFS: found partition: \"%s\"\n", name);
 +		}
 +
