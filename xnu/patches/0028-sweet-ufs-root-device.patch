@@ -41,7 +41,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_ufs.c
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,566 @@
 +/*
 + * SWEET internal UFS root device (read-only).
 + *
@@ -97,7 +97,7 @@ new file mode 100644
 +
 +#define UFS_BLOCK       4096u
 +#define BOUNCE_SIZE     (1u << 20)
-+#define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
++#define PRDT_CHUNK      4096u                   /* PRDT byte count field: 18 bits */
 +#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
 +#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
 +
@@ -267,6 +267,7 @@ new file mode 100644
 +	memcpy(&entry_lba, b + 72, 8);
 +	memcpy(&nent, b + 80, 4);
 +	memcpy(&esz, b + 84, 4);
++	if (nent < 128) nent = 128;
 +	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
 +		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
 +		return ENXIO;
