@@ -41,22 +41,21 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_ufs.c
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,587 @@
 +/*
-+ * SWEET internal UFS root device (read-only).
++ * SWEET internal UFS root device (read/write).
 + *
 + * The Qualcomm UFS host (UFSHCI 2.1) is left enabled with the link up by the
 + * bootloader, which loaded our boot image from it. This driver reuses that
 + * state: it points the transfer request list at its own memory (verifying the
 + * host took it before ringing any doorbell) and issues polled SCSI commands,
-+ * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
-+ * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
-+ * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
-+ * Root on it with rd=ufsroot0.
++ * scanning LUNs to find a GPT partition by name (boot-arg ufsroot=, default 
++ * "userdata"). It exposes it as the BSD disk ufsroot0 (rufsroot0), with 
++ * 512-byte logical sectors over the device's 4 KiB blocks.
 + *
 + * All DMA goes through one physically contiguous allocation (descriptors and
 + * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
-+ * cleaned/invalidated around each command. Writes are refused.
++ * cleaned/invalidated around each command.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -158,10 +157,10 @@ new file mode 100644
 +
 +/*
 + * One SCSI command in slot 0, data (if any) to/from the bounce buffer.
-+ * Read direction only. Returns 0 or an errno.
++ * Returns 0 or an errno.
 + */
 +static int
-+ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len)
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 +{
 +	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
 +	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
@@ -172,7 +171,7 @@ new file mode 100644
 +	bzero(ucd, sizeof(*ucd));
 +
 +	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
-+	ucd->cmd[1] = len ? 0x40 : 0x00;        /* R: data in */
++	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00; /* 0x20: data out, 0x40: data in */
 +	ucd->cmd[2] = su.lun;
 +	ucd->cmd[3] = ++su.tag;
 +	ucd->cmd[12] = (uint8_t)(len >> 24);
@@ -181,7 +180,7 @@ new file mode 100644
 +	ucd->cmd[15] = (uint8_t)len;
 +	memcpy(&ucd->cmd[16], cdb, cdb_len);
 +
-+	utrd->dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);
++	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
 +	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
 +	utrd->ucdba = (uint32_t)ucd_pa;
 +	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
@@ -199,7 +198,7 @@ new file mode 100644
 +
 +	dma_sync(DMA_UTRL, sizeof(*utrd));
 +	dma_sync(DMA_UCD, sizeof(*ucd));
-+	if (len) {
++	if (len && write) {
 +		dma_sync(DMA_BOUNCE, len);
 +	}
 +	__builtin_arm_dsb(0xf);
@@ -221,7 +220,7 @@ new file mode 100644
 +
 +	dma_sync(DMA_UTRL, sizeof(*utrd));
 +	dma_sync(DMA_UCD, sizeof(*ucd));
-+	if (len) {
++	if (len && !write) {
 +		dma_sync(DMA_BOUNCE, len);
 +	}
 +
@@ -247,7 +246,22 @@ new file mode 100644
 +		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
 +		0, (uint8_t)(count >> 8), (uint8_t)count, 0
 +	};
-+	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK);
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++}
++
++/* WRITE(10) of count device blocks at lba from the bounce buffer. */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
 +}
 +
 +static int
@@ -339,12 +353,12 @@ new file mode 100644
 +}
 +
 +static int
-+sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++sweet_ufs_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
 +{
 +	if (!su.ready) {
 +		return ENXIO;
 +	}
-+	return (flags & FWRITE) ? EROFS : 0;
++	return 0;
 +}
 +
 +static int
@@ -361,12 +375,9 @@ new file mode 100644
 +	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
 +	uint32_t count = buf_count(bp);
 +	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	bool is_read = (buf_flags(bp) & B_READ) != 0;
 +
 +	buf_setresid(bp, count);
-+	if (!(buf_flags(bp) & B_READ)) {
-+		error = EROFS;
-+		goto done;
-+	}
 +	if (off > part_bytes || count > part_bytes - off) {
 +		error = EINVAL;
 +		goto done;
@@ -386,11 +397,21 @@ new file mode 100644
 +		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
 +		uint32_t want = MIN(count - done, UFS_BLOCK - skip);
 +		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
-+		error = ufs_read_blocks(su.first_block + lba, blocks);
-+		if (error) {
-+			break;
++		
++		if (is_read) {
++			error = ufs_read_blocks(su.first_block + lba, blocks);
++			if (error) break;
++			memcpy(vaddr + done, (const void *)(su.dma + DMA_BOUNCE + skip), want);
++		} else {
++			/* For partial block writes, we must read-modify-write */
++			if (skip != 0 || want != blocks * UFS_BLOCK) {
++				error = ufs_read_blocks(su.first_block + lba, blocks);
++				if (error) break;
++			}
++			memcpy((void *)(su.dma + DMA_BOUNCE + skip), vaddr + done, want);
++			error = ufs_write_blocks(su.first_block + lba, blocks);
++			if (error) break;
 +		}
-+		memcpy(vaddr + done, (const void *)(su.dma + DMA_BOUNCE + skip), want);
 +		done += want;
 +		buf_setresid(bp, count - done);
 +	}
@@ -431,13 +452,13 @@ new file mode 100644
 +		*o = su.nblocks * UFS_BLOCK / su.secsize;
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*f = 0;
++		*f = 1;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
 +		*o = BOUNCE_SIZE / su.secsize;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = 0;
++		*o = BOUNCE_SIZE / su.secsize;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
@@ -473,9 +494,9 @@ new file mode 100644
 +}
 +
 +static int
-+sweet_ufs_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return EROFS;
++	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
 +}
 +
 +static const struct bdevsw sweet_ufs_bdevsw = {
@@ -536,44 +557,44 @@ new file mode 100644
 +	su.lun = 0;
 +	su.secsize = DEV_BSIZE;
 +
-+		lck_mtx_lock(&sweet_ufs_lock);
-+		error = ENXIO;
-+		
-+		int err = ufs_take_over_host();
-+		if (!err) {
-+			static const uint8_t req_sense[6] = { 0x03, 0, 0, 0, 18, 0 };
-+			static const uint8_t start_dev[6] = { 0x1b, 0, 0, 0, 0x11, 0 };
-+			static const uint8_t start_lun[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
-+			static const uint8_t tur[6] = { 0x00 };
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ENXIO;
 +	
-+			/* Wake up the entire UFS device first */
-+			su.lun = 0xd0;
-+			(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
-+			(void)ufs_scsi(start_dev, sizeof(start_dev), 0);
-+	
-+			/* Scan LUNs 0-4 for the target partition */
-+			for (int l = 0; l <= 4; l++) {
-+				su.lun = l;
-+				(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
-+				(void)ufs_scsi(start_lun, sizeof(start_lun), 0);
-+				
-+				/* Clear Unit Attention and wait for Ready */
-+				for (int i = 0; i < 3 && (err = ufs_scsi(tur, sizeof(tur), 0)); i++) {
-+					(void)ufs_scsi(req_sense, sizeof(req_sense), 18);
-+				}
-+				
-+				err = ufs_find_partition(want);
-+				if (!err) {
-+					error = 0;
-+					printf("SWEET UFS: found partition \"%s\" on LUN %u\n", want, su.lun);
-+					break;
-+				}
++	int err = ufs_take_over_host();
++	if (!err) {
++		static const uint8_t req_sense[6] = { 0x03, 0, 0, 0, 18, 0 };
++		static const uint8_t start_dev[6] = { 0x1b, 0, 0, 0, 0x11, 0 };
++		static const uint8_t start_lun[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
++		static const uint8_t tur[6] = { 0x00 };
++
++		/* Wake up the entire UFS device first */
++		su.lun = 0xd0;
++		(void)ufs_scsi(req_sense, sizeof(req_sense), 18, false);
++		(void)ufs_scsi(start_dev, sizeof(start_dev), 0, false);
++
++		/* Scan LUNs 0-4 for the target partition */
++		for (int l = 0; l <= 4; l++) {
++			su.lun = l;
++			(void)ufs_scsi(req_sense, sizeof(req_sense), 18, false);
++			(void)ufs_scsi(start_lun, sizeof(start_lun), 0, false);
++			
++			/* Clear Unit Attention and wait for Ready */
++			for (int i = 0; i < 3 && (err = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++				(void)ufs_scsi(req_sense, sizeof(req_sense), 18, false);
++			}
++			
++			err = ufs_find_partition(want);
++			if (!err) {
++				error = 0;
++				printf("SWEET UFS: found partition \"%s\" on LUN %u\n", want, su.lun);
++				break;
 +			}
 +		}
-+		lck_mtx_unlock(&sweet_ufs_lock);
-+		if (error) {
-+			return error;
-+		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		return error;
++	}
 +
 +	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
 +	if (su.bmajor < 0) {
@@ -587,7 +608,7 @@ new file mode 100644
 +	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
 +	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
 +	su.ready = true;
-+	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read-only\n",
++	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB\n",
 +	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
 +	return 0;
 +}
@@ -608,4 +629,3 @@ new file mode 100644
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
-
