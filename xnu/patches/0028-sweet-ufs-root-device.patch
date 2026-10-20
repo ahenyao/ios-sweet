@@ -505,7 +505,7 @@ new file mode 100644
 +	DTEntry node;
 +	uintptr_t const *reg = NULL;
 +	unsigned int size = 0;
-+	char want[64] = "userdata";
++	char want[64] = "USERDATA";
 +	int error;
 +
 +	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
