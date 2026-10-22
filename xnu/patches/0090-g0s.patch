@@ -1,0 +1,13 @@
+diff --git a/xnu/iokit/Kernel/arm/hid/SweetHID.cpp b/xnu/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/xnu/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/xnu/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -152,7 +152,7 @@
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
++	int native = 1;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+
