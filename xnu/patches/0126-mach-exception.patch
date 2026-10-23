@@ -18,7 +18,7 @@ diff --git a/xnu/osfmk/kern/exception.c b/xnu/osfmk/kern/exception.c
         mutex = &task->itk_lock_data;
 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+       sweet_crash_strings("Mach exception")
++       sweet_crash_strings("Mach exception");
 +#endif
         kr = exception_deliver(self, exception, code, codeCnt, task->exc_actions, mutex);
 
