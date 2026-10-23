@@ -28,12 +28,12 @@ diff --git a/xnu/osfmk/kern/exception.c b/xnu/osfmk/kern/exception.c
 diff --git a/xnu/bsd/kern/kern_memorystatus.c b/xnu/bsd/kern/kern_memorystatus.c
 --- a/xnu/bsd/kern/kern_memorystatus.c
 +++ b/xnu/bsd/kern/kern_memorystatus.c
-@@ -4369,6 +4369,8 @@ proc_jetsam_state_is_active_locked(proc_t p)
+@@ -4369,6 +4369,8 @@
  static boolean_t
  memorystatus_kill_process_sync(pid_t victim_pid, uint32_t cause, os_reason_t jetsam_reason)
  {
-+/* Lab bring-up: Disable Jetsam out-of-memory kills entirely */
-+return FALSE;
-        boolean_t res;
-
-        uint32_t errors = 0;
++	/* Lab bring-up: Disable Jetsam out-of-memory kills entirely */
++	return FALSE;
+ 	boolean_t res;
+ 
+ 	uint32_t errors = 0;
