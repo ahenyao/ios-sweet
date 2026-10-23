@@ -75,7 +75,7 @@ jobs:
         run: bash build.sh
 
       - name: Package build tree for local compiles
-        if: always()
+        # if: always() 
         run: |
           # Generated headers, config option headers, mig output and the patched
           # source: enough to re-run any single compile command from the log locally.
@@ -90,14 +90,14 @@ jobs:
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        # if: always()
         with:
           name: xnu-buildtree
           path: buildtree.tgz
           retention-days: 7
 
       - name: Inspect closed KDK support libs
-        if: always()
+        # if: always()
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
@@ -109,7 +109,7 @@ jobs:
           ls -la out/kdk-libs
 
       - name: Collect
-        if: always()
+        # if: always()
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
@@ -117,7 +117,7 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        # if: always()
         with:
           name: xnu-kernel
           path: out/
