@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -37,10 +37,15 @@
+@@ -34,10 +34,15 @@
  #include <pexpert/pexpert.h>
  #include <pexpert/device_tree.h>
  #include <libkern/libkern.h>
@@ -16,7 +16,7 @@
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -591,9 +596,116 @@
+@@ -582,9 +587,116 @@
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
