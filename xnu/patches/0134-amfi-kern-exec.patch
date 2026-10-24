@@ -38,3 +38,26 @@
  	/* Initialize the common data in the image_params structure */
  	imgp->ip_user_fname = uap->path;
  	imgp->ip_user_argv = uap->argv;
+
+
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2312,6 +2312,17 @@
+ 	}
+ 	kfree_type(struct nameidata, ndp);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error != 0 && uap->path != USER_ADDR_NULL) {
++		char *err_path = zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_ZERO);
++		size_t err_len;
++		if (copyinstr(uap->path, err_path, MAXPATHLEN, &err_len) == 0) {
++			printf("SWEET SPAWN FATAL: %s failed to spawn with kernel error %d\n", err_path, error);
++		}
++		zfree(ZV_NAMEI, err_path);
++	}
++#endif
++
+ 	return error;
+ }
+ 
