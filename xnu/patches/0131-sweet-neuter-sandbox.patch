@@ -1,0 +1,26 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -288,21 +288,8 @@
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ {
+-	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+-		sweet_sandbox_seen |= 1ULL << call;
+-		char name[32];
+-		proc_name(proc_pid(p), name, sizeof(name));
+-		printf("SWEET Sandbox: %s op %d\n", name, call);
+-	}
+-	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+-	case 0x43:      /* container expected */
+-		return ENOENT;
+-	default:
+-		return 0;
+-	}
++	// SWEET: Always return success for all sandbox syscall ops to appease xpcproxy
++	return 0;
+ }
+ 
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
