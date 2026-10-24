@@ -5,7 +5,7 @@
  		do {
  			if (!_wireCount) {
 -				panic("IOGMD: not wired for the IODMACommand");
-+				this->prepare(kIODirectionInOut);
++				const_cast<IOGeneralMemoryDescriptor*>(this)->prepare(kIODirectionInOut);
  			}
 
  			assert(_memoryEntries);
