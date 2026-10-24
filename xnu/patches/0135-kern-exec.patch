@@ -1,0 +1,19 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2076,6 +2076,16 @@
+ bad:
+ 	/* If we hit this, we likely would have leaked an exit reason */
+ 	assert(exec_failure_reason == OS_REASON_NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error != 0 && imgp && imgp->ip_user_fname != USER_ADDR_NULL) {
++		char *err_path = zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_ZERO);
++		size_t err_len;
++		if (copyinstr(imgp->ip_user_fname, err_path, MAXPATHLEN, &err_len) == 0) {
++			printf("SWEET SPAWN FATAL (bad): %s failed to spawn with kernel error %d\n", err_path, error);
++		}
++		zfree(ZV_NAMEI, err_path);
++	}
++#endif
+ 	return error;
+ }
+ 
