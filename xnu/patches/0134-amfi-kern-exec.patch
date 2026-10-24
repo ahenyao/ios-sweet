@@ -1,0 +1,40 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -262,11 +262,8 @@
+     __unused int flags, __unused unsigned int platform,
+     __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
+ {
+-	mount_t mp = vnode_mount(vp);
+ 	*cs_flags |= CS_SIGNED;
+-	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+-		*cs_flags |= CS_PLATFORM_BINARY;
+-	}
++	*cs_flags |= CS_PLATFORM_BINARY; /* SWEET: Force ALL binaries as platform */
+ 	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+ 		sweet_amfi_attach_entitlements(cs_blob);
+ 	}
+
+
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3429,6 +3429,19 @@
+ 	vap = &__spawn_data->va;
+ 	origvap = &__spawn_data->origva;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		char *sw_path = zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_ZERO);
++		size_t sw_len;
++		if (sw_path != NULL && copyinstr(uap->path, sw_path, MAXPATHLEN, &sw_len) == 0) {
++			printf("SWEET SPAWN: %s[%d] attempting spawn: %s\n", p->p_comm, proc_getpid(p), sw_path);
++		}
++		if (sw_path != NULL) {
++			zfree(ZV_NAMEI, sw_path);
++		}
++	}
++#endif
++
+ 	/* Initialize the common data in the image_params structure */
+ 	imgp->ip_user_fname = uap->path;
+ 	imgp->ip_user_argv = uap->argv;
