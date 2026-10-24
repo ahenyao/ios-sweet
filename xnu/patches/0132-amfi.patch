@@ -1,0 +1,42 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -313,24 +313,25 @@
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+-	if (priv == PRIV_WORK_INTERVAL) {
+-		return 0;
+-	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+-	for (int i = 0; i < sweet_priv_logged_count; i++) {
+-		if (sweet_priv_logged[i].priv == priv &&
+-		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {
+-			return 0; /* SWEET: Always allow even on repeat checks */
+-		}
+-	}
+ 	if (sweet_priv_logged_count < SWEET_PRIV_LOG_MAX) {
+-		sweet_priv_logged[sweet_priv_logged_count].priv = priv;
+-		strlcpy(sweet_priv_logged[sweet_priv_logged_count].name, name, sizeof(name));
+-		sweet_priv_logged_count++;
+-		printf("SWEET Sandbox: %s privilege %d denied\n", name, priv);
++		bool already_logged = false;
++		for (int i = 0; i < sweet_priv_logged_count; i++) {
++			if (sweet_priv_logged[i].priv == priv &&
++			    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {
++				already_logged = true;
++				break;
++			}
++		}
++		if (!already_logged) {
++			sweet_priv_logged[sweet_priv_logged_count].priv = priv;
++			strlcpy(sweet_priv_logged[sweet_priv_logged_count].name, name, sizeof(name));
++			sweet_priv_logged_count++;
++			printf("SWEET Sandbox: %s privilege %d requested (allowed)\n", name, priv);
++		}
+ 	}
+-	return 0; /* SWEET Sandbox: always allow privileges for lab bring-up */
++	return 0; /* SWEET Sandbox: unconditionally allow all privileges for bring-up */
+ }
+ 
+ static const struct mac_policy_ops sweet_sandbox_mac_ops = {
