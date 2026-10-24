@@ -24,3 +24,14 @@
  }
  
  static const struct mac_policy_ops sweet_amfi_mac_ops = {
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -321,7 +321,7 @@
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
+ 		if (sweet_priv_logged[i].priv == priv &&
+ 		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {
+-			return EPERM;
++			return 0; /* SWEET: Always allow even on repeat checks */
+ 		}
+ 	}
+ 	if (sweet_priv_logged_count < SWEET_PRIV_LOG_MAX) {
