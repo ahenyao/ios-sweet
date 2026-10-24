@@ -1,0 +1,11 @@
+--- a/iokit/Kernel/IOMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOMemoryDescriptor.cpp
+@@ -3245,7 +3245,7 @@
+ 	else {
+ 		do {
+ 			if (!_wireCount) {
+-				panic("IOGMD: not wired for the IODMACommand");
++				this->prepare(kIODirectionInOut);
+ 			}
+
+ 			assert(_memoryEntries);
