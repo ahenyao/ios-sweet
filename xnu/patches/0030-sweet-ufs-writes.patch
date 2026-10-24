@@ -81,15 +81,15 @@
  	if (off > part_bytes || count > part_bytes - off) {
  		error = EINVAL;
  		goto done;
-@@ -321,16 +342,22 @@
+@@ -321,16 +341,22 @@
  		uint64_t pos = off + done;
  		uint64_t lba = pos / UFS_BLOCK;
  		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
 -		uint32_t want = MIN(count - done, UFS_BLOCK - skip);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
  		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
 -		
 -		if (is_read) {
-+		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
 +		void *bounce = (void *)(su.dma + DMA_BOUNCE);
 +
 +		if (rd) {
@@ -111,7 +111,7 @@
 +			}
  		}
  		done += want;
-@@ -367,13 +394,23 @@
+@@ -367,13 +393,23 @@
  	case DKIOCGETBLOCKCOUNT:
  		*o = su.nblocks * UFS_BLOCK / su.secsize;
  		return 0;
@@ -137,7 +137,7 @@
 +		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
  		return 0;
  	case DKIOCGETMAXSEGMENTCOUNTREAD:
-@@ -410,7 +447,10 @@
+@@ -410,7 +446,10 @@
  static int
  sweet_ufs_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
  {
@@ -149,7 +149,7 @@
  }
  
  static const struct bdevsw sweet_ufs_bdevsw = {
-@@ -461,6 +501,8 @@
+@@ -461,6 +500,8 @@
  		return ENXIO;
  	}
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
@@ -158,7 +158,7 @@
  
  	su.regs = ml_io_map(reg[0], reg[1]);
  	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
-@@ -528,8 +570,11 @@
+@@ -528,8 +569,11 @@
  	su.bdev = makedev(su.bmajor, 0);
  	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
  	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
