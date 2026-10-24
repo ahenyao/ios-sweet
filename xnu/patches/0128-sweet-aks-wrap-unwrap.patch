@@ -5,10 +5,10 @@
  	kAKSGetSystem        = 14,
  	kAKSGetDeviceState   = 17,
 +	kAKSGetConfig        = 31,
- 	kAKSGetExtDeviceState = 35,	/* aks_get_extended_device_state */
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
  	kAKSAssertHold       = 26,
  	kAKSAssertDrop       = 27,
-@@ -118,6 +119,27 @@
+@@ -119,6 +120,26 @@
  	return kIOReturnSuccess;
  }
  
@@ -35,7 +35,7 @@
  /* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
  static uint32_t
  sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
-@@ -222,7 +244,44 @@
+@@ -222,7 +243,43 @@
  		args->scalarOutput[0] = 0;
  		args->scalarOutputCount = 1;
  		break;
