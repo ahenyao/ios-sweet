@@ -1,0 +1,8 @@
+--- a/osfmk/arm/machine_routines_common.c
++++ b/osfmk/arm/machine_routines_common.c
+@@ -176,3 +176,4 @@
+ 	if (size_of_state > sizeof(struct perfcontrol_state)) {
+-		panic("%s: Invalid required state size %lu", __FUNCTION__, size_of_state);
++		printf("%s: WARNING: requested state size %lu exceeds kernel struct size %lu (bypassed)\n",
++		    __FUNCTION__, size_of_state, sizeof(struct perfcontrol_state));
+ 	}
