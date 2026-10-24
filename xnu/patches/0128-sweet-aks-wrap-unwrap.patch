@@ -1,0 +1,81 @@
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -41,6 +41,7 @@
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
+ 	kAKSGetDeviceState   = 17,
++	kAKSGetConfig        = 31,
+ 	kAKSGetExtDeviceState = 35,	/* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
+@@ -118,6 +119,27 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Copy input structure (inband or descriptor) into buf. */
++static IOReturn
++sweet_aks_struct_in(IOExternalMethodArguments *args, void *buf, uint32_t max_len, uint32_t *out_len)
++{
++	uint32_t len = args->structureInputDescriptor != NULL ?
++	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++	if (len > max_len) {
++		return kIOReturnNoSpace;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		args->structureInputDescriptor->readBytes(0, buf, len);
++	} else if (args->structureInput != NULL && len > 0) {
++		memcpy(buf, args->structureInput, len);
++	} else if (len > 0) {
++		return kIOReturnBadArgument;
++	}
++	*out_len = len;
++	return kIOReturnSuccess;
++}
++
+ /* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+ static uint32_t
+ sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+@@ -222,7 +244,44 @@
+ 		args->scalarOutput[0] = 0;
+ 		args->scalarOutputCount = 1;
+ 		break;
++	case kAKSWrapKey: {
++		uint8_t buf[136];
++		uint32_t len = 0;
++		memset(buf, 0xa6, sizeof(buf));
++		ret = sweet_aks_struct_in(args, buf, 128, &len);
++		if (ret != kIOReturnSuccess) {
++			break;
++		}
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = in_scalars > 1 ? args->scalarInput[1] : 1;
++			args->scalarOutputCount = 1;
++		} else {
++			args->scalarOutputCount = 0;
++		}
++		ret = sweet_aks_struct_out(args, buf, len + 8);
++		break;
++	}
++	case kAKSUnwrapKey: {
++		uint8_t buf[136];
++		uint32_t len = 0;
++		memset(buf, 0, sizeof(buf));
++		ret = sweet_aks_struct_in(args, buf, sizeof(buf), &len);
++		if (ret != kIOReturnSuccess || len < 8) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = in_scalars > 1 ? args->scalarInput[1] : 1;
++			args->scalarOutputCount = 1;
++		} else {
++			args->scalarOutputCount = 0;
++		}
++		ret = sweet_aks_struct_out(args, buf, len - 8);
++		break;
++	}
+ 	case kAKSGetDeviceState:
++	case kAKSGetConfig:
+ 	case kAKSGetExtDeviceState:
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
