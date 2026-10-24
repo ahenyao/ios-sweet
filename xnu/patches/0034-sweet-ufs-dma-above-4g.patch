@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -36,6 +36,7 @@
+@@ -35,6 +35,7 @@
  /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
  extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  
@@ -16,7 +16,8 @@
  
  #define UFS_BLOCK       4096u
  #define BOUNCE_SIZE     (1u << 20)
-@@ -262,6 +264,12 @@
+@@ -324,7 +326,13 @@
+ 	if (ufs_rd(REG_UTRLDBR)) {
  		printf("SWEET UFS: requests outstanding from the bootloader\n");
  		return EBUSY;
  	}
@@ -29,7 +30,7 @@
  	ufs_wr(REG_IE, 0);                      /* polled operation */
  	ufs_wr(REG_IS, ufs_rd(REG_IS));
  	ufs_wr(REG_UTRLRSR, 0);
-@@ -571,9 +579,9 @@
+@@ -569,8 +577,8 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;

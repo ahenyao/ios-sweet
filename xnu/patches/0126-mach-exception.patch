@@ -1,4 +1,3 @@
-diff --git a/bsd/kern/kern_core.c b/bsd/kern/kern_core.c
 --- a/bsd/kern/kern_core.c
 +++ b/bsd/kern/kern_core.c
 @@ -125,7 +125,7 @@ void task_act_iterate_wth_args(task_t, void (*)(thread_t, void *), void *);
@@ -9,23 +8,19 @@ diff --git a/bsd/kern/kern_core.c b/bsd/kern/kern_core.c
 +__XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: dump cores */
  #endif /* SECURE_KERNEL */
  __XNU_PRIVATE_EXTERN int sugid_coredump = 0; /* default: but not SGUID binaries */
-
-diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+ 
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1009,6 +1009,9 @@ bsd_exception(
-        task = current_task();
-        mutex = &task->itk_lock_data;
-
+@@ -1059,6 +1059,9 @@ bsd_exception(
+ 	task = current_task();
+ 	mutex = &task->itk_lock_data;
+ 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+       sweet_crash_strings("Mach exception");
++	sweet_crash_strings("Mach exception");
 +#endif
-        kr = exception_deliver(self, exception, code, codeCnt, task->exc_actions, mutex);
-
-        if (kr == KERN_SUCCESS || kr == MACH_RCV_PORT_DIED) {
-
-
-diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+ 	kr = exception_deliver(self, exception, code, codeCnt, task->exc_actions, mutex);
+ 
+ 	if (kr == KERN_SUCCESS || kr == MACH_RCV_PORT_DIED) {
 --- a/bsd/kern/kern_memorystatus.c
 +++ b/bsd/kern/kern_memorystatus.c
 @@ -4369,6 +4369,8 @@

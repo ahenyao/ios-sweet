@@ -17,8 +17,8 @@
  extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
  extern void thread_deallocate(thread_t);
  extern int hz;
-@@ -70,6 +73,8 @@
- #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+@@ -72,6 +75,8 @@
+ #define PRDT_CHUNK      4096u                   /* PRDT byte count field: 18 bits */
  #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
  #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
 +#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
@@ -26,7 +26,7 @@
  
  struct utrd {
  	uint32_t dw0, dw1, dw2, dw3;
-@@ -101,6 +106,8 @@
+@@ -103,6 +108,8 @@
  	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
  	uint32_t secsize;                       /* logical sector size for the BSD layer */
  	bool writable;                          /* boot-arg ufsrw=1 */
@@ -35,7 +35,7 @@
  	int bmajor, cmajor;
  	dev_t bdev;
  	bool ready;
-@@ -127,6 +134,12 @@
+@@ -129,6 +136,12 @@
  	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
  }
  
@@ -46,9 +46,9 @@
 +}
 +
  /*
-  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
-  * (to the device when write is set). Returns 0 or an errno.
-@@ -169,10 +182,24 @@
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer.
+  * Read direction only. Returns 0 or an errno.
+@@ -172,10 +185,24 @@
  		utrd->prdt = (1024u / 4) << 16 | n;
  	}
  
@@ -68,7 +68,7 @@
 +	}
  	if (len) {
 -		dma_sync(DMA_BOUNCE, len);
-+		if (su.cache && write) {
++		if (su.cache && cdb[0] == 0x2a) {
 +			dma_clean(DMA_BOUNCE, len);
 +		} else {
 +			dma_sync(DMA_BOUNCE, len);
@@ -76,7 +76,7 @@
  	}
  	__builtin_arm_dsb(0xf);
  
-@@ -180,20 +207,42 @@
+@@ -184,20 +211,42 @@
  	uint64_t deadline;
  	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
  	deadline += mach_absolute_time();
@@ -119,11 +119,11 @@
 +	} else {
 +		dma_sync(DMA_UCD, sizeof(*ucd));
 +	}
-+	if (len && !(su.cache && write)) {
++	if (len && !(su.cache && cdb[0] == 0x2a)) {
  		dma_sync(DMA_BOUNCE, len);
  	}
  
-@@ -551,6 +600,11 @@
+@@ -517,6 +566,11 @@
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
  	uint32_t rw = 0;
  	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
@@ -135,7 +135,7 @@
  
  	su.regs = ml_io_map(reg[0], reg[1]);
  	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
-@@ -613,8 +667,8 @@
+@@ -594,19 +648,21 @@
   * console (kernel printf and /dev/console writes of daemons, both through
   * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
   * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
@@ -146,7 +146,7 @@
   *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
   *   | u64 flush sequence
   * ring offset of byte n = n % ring size. Read it from a recovery with
-@@ -622,10 +676,12 @@
+  * tools/sweet-log-pull.sh. Disabled with boot-arg sweetlog=0.
   */
  #define SWEET_LOG_SIZE          (4u << 20)
  #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
@@ -159,7 +159,7 @@
  
  /* Called for all console output, any context: never blocks. */
  void sweet_log_append(const char *c, int size);
-@@ -658,7 +714,7 @@
+@@ -639,7 +695,7 @@
  	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
  	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
  	for (;;) {
@@ -168,7 +168,7 @@
  		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
  		if (total == flushed) {
  			continue;
-@@ -708,6 +764,10 @@
+@@ -689,6 +745,10 @@
  	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
  		return;
  	}
