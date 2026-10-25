@@ -1,11 +1,58 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -263,7 +263,7 @@
+@@ -262,14 +262,20 @@
+     __unused int flags, __unused unsigned int platform,
      __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
  {
- 	*cs_flags |= CS_SIGNED;
+-	*cs_flags |= CS_SIGNED;
 -	*cs_flags |= CS_PLATFORM_BINARY; /* SWEET: Force ALL binaries as platform */
-+	
- 	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
- 		sweet_amfi_attach_entitlements(cs_blob);
+-	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+-		sweet_amfi_attach_entitlements(cs_blob);
+-	}
+-	return 0;
++    /* 
++     * SWEET: launchd requires early boot tasks (like mount) to be platform binaries.
++     * We must apply CS_SIGNED and CS_PLATFORM_BINARY. 
++     * Do NOT add CS_VALID or CS_ENTITLEMENTS_VALIDATED, to avoid lsd deadlocks.
++     */
++    *cs_flags |= (CS_SIGNED | CS_PLATFORM_BINARY);
++
++    if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
++        sweet_amfi_attach_entitlements(cs_blob);
++    }
++    return 0;
+ }
+ 
++
+ /*
+  * Policy "Sandbox": libsystem_sandbox calls __mac_syscall("Sandbox", op,
+  * arg). Without a policy of that name every call fails with ENOPOLICY and
+@@ -300,8 +306,27 @@
  	}
+ }
+ 
++/*
++ * Policy "SWEET AMFI": Userland daemons (like lsd and pkd via libmis) 
++ * will invoke mac_syscall("AMFI", ...) to query trust cache status 
++ * or validate cdhashes. We unconditionally approve them.
++ */
++static int
++sweet_amfi_syscall(struct proc *p, int call, __unused user_addr_t arg)
++{
++    char name[32];
++    proc_name(proc_pid(p), name, sizeof(name));
++    
++    /* Log occasional AMFI syscalls from lsd/pkd to track progress */
++    if (strncmp(name, "lsd", 3) == 0 || strncmp(name, "pkd", 3) == 0) {
++        printf("SWEET AMFI: %s[%d] allowed mac_syscall op %d\n", name, proc_pid(p), call);
++    }
++    
++    return 0; /* Unconditionally trusted */
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+-	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++    .mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+ };
+ 
+ /*
