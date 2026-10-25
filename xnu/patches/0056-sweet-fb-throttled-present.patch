@@ -40,7 +40,7 @@
 +		}
 +	}
  	IOLockUnlock(fb->fLock);
-+	if (rec != NULL) {
++	if ((count % 30) == 0) { uint32_t hbv = ((count / 30) & 1) ? 0xffffffff : 0xff00ff00; for (uint32_t hy = 0; hy < 120; hy++) { volatile uint32_t *hbr = (volatile uint32_t *)(fb->fPixels + (uint64_t)hy * fb->fRowBytes); for (uint32_t hx = 0; hx < 120; hx++) { hbr[hx] = hbv; } } } if (rec != NULL) {
 +		fb->present(rec);
 +		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
 +	}
