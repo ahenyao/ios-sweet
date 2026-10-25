@@ -67,7 +67,7 @@
 +	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
 +	fDirty = true;
 +	IOLockUnlock(fLock);
-+	if ((++sweet_fb_swap_count % 1000) == 0) {
++	if ((++sweet_fb_swap_count % 20) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
 +}
@@ -75,7 +75,7 @@
 +void
 +AppleCLCD::present(const uint8_t *rec)
 +{
-+	uint32_t mask = get32(rec, 0x104);
++	uint32_t mask = get32(rec, 0x104); static uint32_t dbgn; if (dbgn++ < 40) { IOLog("SWEET FB: present swap %u mask 0x%x ids %u %u %u %u\n", get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60)); }
 +
  
  	if (!fConsolePaused) {
