@@ -75,7 +75,7 @@
 +void
 +AppleCLCD::present(const uint8_t *rec)
 +{
-+	uint32_t mask = get32(rec, 0x104); static uint32_t dbgn; if (dbgn++ < 40) { IOLog("SWEET FB: present swap %u mask 0x%x ids %u %u %u %u\n", get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60)); }
++	uint32_t mask = get32(rec, 0x104); static uint32_t dbgn; if (dbgn++ < 40) { IOLog("SWEET FB: present swap %u mask 0x%x ids %u %u %u %u\n", get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60)); } if (dbgn == 1) { for (uint32_t ty = 0; ty < fHeight; ty++) { volatile uint32_t *trow = (volatile uint32_t *)(fPixels + (uint64_t)ty * fRowBytes); for (uint32_t tx = 0; tx < fWidth; tx++) { trow[tx] = 0xffff0000; } } }
 +
  
  	if (!fConsolePaused) {
