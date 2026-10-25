@@ -1,0 +1,46 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -263,11 +263,10 @@
+     __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
+ {
+     /* 
+-     * SWEET: launchd requires early boot tasks (like mount) to be platform binaries.
+-     * We must apply CS_SIGNED and CS_PLATFORM_BINARY. 
+-     * Do NOT add CS_VALID or CS_ENTITLEMENTS_VALIDATED, to avoid lsd deadlocks.
++     * SWEET: Restore ALL flags. Without CS_VALID and CS_ENTITLEMENTS_VALIDATED, 
++     * the csops() syscall fails and daemons like PosterBoard will SIGTRAP.
+      */
+-    *cs_flags |= (CS_SIGNED | CS_PLATFORM_BINARY);
++    *cs_flags |= (CS_SIGNED | CS_PLATFORM_BINARY | CS_VALID | CS_ENTITLEMENTS_VALIDATED);
+ 
+     if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+         sweet_amfi_attach_entitlements(cs_blob);
+@@ -307,26 +306,17 @@
+ }
+ 
+ /*
+- * Policy "SWEET AMFI": Userland daemons (like lsd and pkd via libmis) 
+- * will invoke mac_syscall("AMFI", ...) to query trust cache status 
+- * or validate cdhashes. We unconditionally approve them.
++ * Restore the mac_syscall hook to satisfy lsd and PlugInKit trust cache queries.
+  */
+ static int
+ sweet_amfi_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ {
+-    char name[32];
+-    proc_name(proc_pid(p), name, sizeof(name));
+-    
+-    /* Log occasional AMFI syscalls from lsd/pkd to track progress */
+-    if (strncmp(name, "lsd", 3) == 0 || strncmp(name, "pkd", 3) == 0) {
+-        printf("SWEET AMFI: %s[%d] allowed mac_syscall op %d\n", name, proc_pid(p), call);
+-    }
+-    
+     return 0; /* Unconditionally trusted */
+ }
+ 
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+     .mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++    .mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
