@@ -1,14 +1,17 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -35,6 +35,7 @@
+@@ -33,8 +33,10 @@
+ #include <sys/proc.h>
+ #include <sys/systm.h>
  #include <sys/ubc_internal.h>
++#include <sys/mount_internal.h>
  #include <sys/vnode.h>
  #include <security/mac_policy.h>
 +#include <sys/attr.h>
  
  /* iokit/Kernel/arm/SweetEntitlements.cpp */
  void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
-@@ -314,9 +315,50 @@
+@@ -314,9 +316,41 @@
      return 0; /* Unconditionally trusted */
  }
  
@@ -35,17 +38,8 @@
 +sweet_amfi_vnode_check_setattrlist(__unused kauth_cred_t cred, __unused struct vnode *vp, 
 +    __unused struct label *vlabel, struct attrlist *alist)
 +{
-+    /* 
-+     * WARNING: Clearing bits in alist->commonattr changes how the kernel unmarshals 
-+     * the user space buffer. If setattrlist is called with multiple attributes mixed 
-+     * together, clearing this bit will shift the data offsets and corrupt the write.
-+     * Foundation typically sets NSFileProtectionKey in isolation, making this safe.
-+     */
-+    if (alist->commonattr & ATTR_CMN_DATAPROTECT_CLASS) {
-+        alist->commonattr &= ~ATTR_CMN_DATAPROTECT_CLASS;
-+    }
-+    if (alist->commonattr & ATTR_CMN_DATAPROTECT_FLAGS) {
-+        alist->commonattr &= ~ATTR_CMN_DATAPROTECT_FLAGS;
++    if (alist->commonattr & ATTR_CMN_DATA_PROTECT_FLAGS) {
++        alist->commonattr &= ~ATTR_CMN_DATA_PROTECT_FLAGS;
 +    }
 +    return 0;
 +}
