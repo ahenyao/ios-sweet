@@ -62,7 +62,7 @@
  		break;
 +	case kSweetFBRequestPowerChange:
 +		if (args->scalarInputCount >= 1) {
-+			bool off = args->scalarInput[0] == 0;
++			bool off = false;
 +			IOLockLock(fFB->fLock);
 +			if (off != fFB->fPowerOff) {
 +				fFB->fPowerOff = off;
