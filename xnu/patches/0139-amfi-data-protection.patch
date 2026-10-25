@@ -1,6 +1,6 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -33,8 +33,10 @@
+@@ -33,8 +33,11 @@
  #include <sys/proc.h>
  #include <sys/systm.h>
  #include <sys/ubc_internal.h>
@@ -8,10 +8,11 @@
  #include <sys/vnode.h>
  #include <security/mac_policy.h>
 +#include <sys/attr.h>
++#include <sys/imgact.h>
  
  /* iokit/Kernel/arm/SweetEntitlements.cpp */
  void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
-@@ -314,9 +316,41 @@
+@@ -314,9 +317,49 @@
      return 0; /* Unconditionally trusted */
  }
  
@@ -44,12 +45,20 @@
 +    return 0;
 +}
 +
++static int
++sweet_amfi_vnode_check_exec(__unused kauth_cred_t cred, __unused struct vnode *vp, 
++    __unused struct label *vlabel, __unused struct label *execlabel, 
++    __unused struct image_params *imgp, __unused struct label *macpolicy_ep)
++{
++    return 0; /* Unconditionally allow */
++}
++
 +
  static const struct mac_policy_ops sweet_amfi_mac_ops = {
      .mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
      .mpo_policy_syscall = sweet_amfi_syscall,
 +    .mpo_mount_check_stat = sweet_amfi_mount_check_stat,
-+    /* .mpo_vnode_check_setattrlist = sweet_amfi_vnode_check_setattrlist, */
++    .mpo_vnode_check_exec = sweet_amfi_vnode_check_exec,
  };
  
  /*
