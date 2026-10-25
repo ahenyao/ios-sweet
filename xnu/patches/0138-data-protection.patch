@@ -1,0 +1,19 @@
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -2754,6 +2754,16 @@
+ 	AUDIT_ARG(fd, uap->fd);
+ 	AUDIT_ARG(cmd, uap->cmd);
+ 
++	/* SWEET: Spoof Data Protection class operations to prevent userland crashes */
++	if (cmd == F_SETPROTECTIONCLASS) {
++		*retval = 0;
++		return 0;
++	}
++	if (cmd == F_GETPROTECTIONCLASS) {
++		*retval = 2; /* PROTECTION_CLASS_C */
++		return 0;
++	}
++
+ 	proc_fdlock(p);
+ 	if ((error = fp_lookup(p, fd, &fp, 1))) {
+ 		proc_fdunlock(p);
