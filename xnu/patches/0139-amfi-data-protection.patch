@@ -49,7 +49,7 @@
      .mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
      .mpo_policy_syscall = sweet_amfi_syscall,
 +    .mpo_mount_check_stat = sweet_amfi_mount_check_stat,
-+    .mpo_vnode_check_setattrlist = sweet_amfi_vnode_check_setattrlist,
++    /* .mpo_vnode_check_setattrlist = sweet_amfi_vnode_check_setattrlist, */
  };
  
  /*
