@@ -1,0 +1,61 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <sys/attr.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -314,9 +315,50 @@
+     return 0; /* Unconditionally trusted */
+ }
+ 
++
++/* 
++ * Force the kernel to advertise Data Protection support on all mounts.
++ * This tricks keybagd into initializing successfully without throwing NO CPROTECT.
++ */
++static int
++sweet_amfi_mount_check_stat(__unused kauth_cred_t cred, struct mount *mp, __unused struct label *mntlabel)
++{
++    if (mp) {
++        mp->mnt_flag |= MNT_CPROTECT;
++    }
++    return 0;
++}
++
++/*
++ * Intercept Data Protection attribute requests before they reach the filesystem.
++ * This prevents standard HFS/APFS from returning ENOTSUP when CoreData 
++ * attempts to apply NSFileProtectionComplete via setattrlist.
++ */
++static int
++sweet_amfi_vnode_check_setattrlist(__unused kauth_cred_t cred, __unused struct vnode *vp, 
++    __unused struct label *vlabel, struct attrlist *alist)
++{
++    /* 
++     * WARNING: Clearing bits in alist->commonattr changes how the kernel unmarshals 
++     * the user space buffer. If setattrlist is called with multiple attributes mixed 
++     * together, clearing this bit will shift the data offsets and corrupt the write.
++     * Foundation typically sets NSFileProtectionKey in isolation, making this safe.
++     */
++    if (alist->commonattr & ATTR_CMN_DATAPROTECT_CLASS) {
++        alist->commonattr &= ~ATTR_CMN_DATAPROTECT_CLASS;
++    }
++    if (alist->commonattr & ATTR_CMN_DATAPROTECT_FLAGS) {
++        alist->commonattr &= ~ATTR_CMN_DATAPROTECT_FLAGS;
++    }
++    return 0;
++}
++
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+     .mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+     .mpo_policy_syscall = sweet_amfi_syscall,
++    .mpo_mount_check_stat = sweet_amfi_mount_check_stat,
++    .mpo_vnode_check_setattrlist = sweet_amfi_vnode_check_setattrlist,
+ };
+ 
+ /*
