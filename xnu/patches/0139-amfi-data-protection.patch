@@ -48,9 +48,9 @@
 +static int
 +sweet_amfi_vnode_check_exec(__unused kauth_cred_t cred, __unused struct vnode *vp, 
 +    __unused struct label *vlabel, __unused struct label *execlabel, 
-+    __unused struct image_params *imgp, __unused struct label *macpolicy_ep)
++    struct image_params *imgp, __unused struct label *macpolicy_ep)
 +{
-+    return 0; /* Unconditionally allow */
++    if (imgp != NULL) imgp->ip_csflags &= ~(CS_HARD | CS_KILL); return 0;
 +}
 +
 +
