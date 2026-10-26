@@ -65,7 +65,7 @@
 -	if ((++sweet_fb_swap_count % 100) == 0) {
 +	IOLockLock(fLock);
 +	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
-+	fDirty = true; static uint32_t dbgs; const uint32_t pal[4] = { 0xffffffff, 0xffff00ff, 0xff00ffff, 0xffffff00 }; dbgs++; for (uint32_t sy = 0; sy < 120; sy++) { volatile uint32_t *srw = (volatile uint32_t *)(fPixels + (uint64_t)sy * fRowBytes); for (uint32_t sx = 130; sx < 250; sx++) { srw[sx] = pal[dbgs & 3]; } }
++	fDirty = true; fSwapID = mask; static uint32_t dbgs; const uint32_t pal[4] = { 0xffffffff, 0xffff00ff, 0xff00ffff, 0xffffff00 }; dbgs++; for (uint32_t sy = 0; sy < 120; sy++) { volatile uint32_t *srw = (volatile uint32_t *)(fPixels + (uint64_t)sy * fRowBytes); for (uint32_t sx = 130; sx < 250; sx++) { srw[sx] = pal[dbgs & 3]; } }
 +	IOLockUnlock(fLock);
 +	if ((++sweet_fb_swap_count % 20) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
