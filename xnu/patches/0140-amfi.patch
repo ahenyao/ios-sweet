@@ -1,0 +1,30 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -265,19 +265,24 @@
+     __unused int flags, __unused unsigned int platform,
+     __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
+ {
+-    /* 
+-     * SWEET: Restore ALL flags. Without CS_VALID and CS_ENTITLEMENTS_VALIDATED, 
++    /*
++     * SWEET: Restore ALL flags. Without CS_VALID and CS_ENTITLEMENTS_VALIDATED,
+      * the csops() syscall fails and daemons like PosterBoard will SIGTRAP.
+      */
+     *cs_flags |= (CS_SIGNED | CS_PLATFORM_BINARY | CS_VALID | CS_ENTITLEMENTS_VALIDATED);
+ 
++    /* FIX: Strip kill flags so vm_fault allows unverified framework/dylib pages */
++    *cs_flags &= ~(CS_HARD | CS_KILL);
++    if (cs_blob != NULL) {
++        cs_blob->csb_flags &= ~(CS_HARD | CS_KILL);
++    }
++
+     if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+         sweet_amfi_attach_entitlements(cs_blob);
+     }
+     return 0;
+ }
+ 
+-
+ /*
+  * Policy "Sandbox": libsystem_sandbox calls __mac_syscall("Sandbox", op,
+  * arg). Without a policy of that name every call fails with ENOPOLICY and
