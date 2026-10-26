@@ -1,0 +1,11 @@
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -4014,7 +4014,7 @@
+ 		blob->csb_hash_pageshift = cd->pageSize;
+ 		hash_pagemask = (1U << cd->pageSize) - 1;
+ 		blob->csb_hash_firstlevel_pageshift = 0;
+-		blob->csb_flags = (ntohl(cd->flags) & CS_ALLOWED_MACHO) | CS_VALID;
++		blob->csb_flags = ((ntohl(cd->flags) & CS_ALLOWED_MACHO) | CS_VALID) & ~(CS_HARD | CS_KILL);
+ 		blob->csb_end_offset = (((vm_offset_t)ntohl(cd->codeLimit) + hash_pagemask) & ~hash_pagemask);
+ 		if ((ntohl(cd->version) >= CS_SUPPORTSSCATTER) && (ntohl(cd->scatterOffset))) {
+ 			const SC_Scatter *scatter = (const SC_Scatter*)
