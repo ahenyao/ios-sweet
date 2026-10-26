@@ -9,3 +9,16 @@
  		blob->csb_end_offset = (((vm_offset_t)ntohl(cd->codeLimit) + hash_pagemask) & ~hash_pagemask);
  		if ((ntohl(cd->version) >= CS_SUPPORTSSCATTER) && (ntohl(cd->scatterOffset))) {
  			const SC_Scatter *scatter = (const SC_Scatter*)
+
+
+
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -344,6 +344,7 @@
+ int
+ cs_process_enforcement(struct proc *p)
+ {
++	return 0;
+ 	if (cs_process_enforcement_enable) {
+ 		return 1;
+ 	}
