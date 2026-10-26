@@ -1,26 +1,23 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -265,19 +265,24 @@
+@@ -265,11 +265,12 @@
      __unused int flags, __unused unsigned int platform,
      __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
  {
 -    /* 
 -     * SWEET: Restore ALL flags. Without CS_VALID and CS_ENTITLEMENTS_VALIDATED, 
+-     * the csops() syscall fails and daemons like PosterBoard will SIGTRAP.
 +    /*
-+     * SWEET: Restore ALL flags. Without CS_VALID and CS_ENTITLEMENTS_VALIDATED,
-      * the csops() syscall fails and daemons like PosterBoard will SIGTRAP.
++     * SWEET: Do NOT set CS_PLATFORM_BINARY here. If we do, the kernel's 
++     * ubc_cs_blob_add will unconditionally force CS_HARD and CS_KILL onto 
++     * the file's blob, causing vm_fault to kill unsealed dynamic libraries.
       */
-     *cs_flags |= (CS_SIGNED | CS_PLATFORM_BINARY | CS_VALID | CS_ENTITLEMENTS_VALIDATED);
+-    *cs_flags |= (CS_SIGNED | CS_PLATFORM_BINARY | CS_VALID | CS_ENTITLEMENTS_VALIDATED);
++    *cs_flags |= (CS_SIGNED | CS_VALID | CS_ENTITLEMENTS_VALIDATED);
  
-+    /* FIX: Strip kill flags so vm_fault allows unverified framework/dylib pages */
-+    *cs_flags &= ~(CS_HARD | CS_KILL);
-+    if (cs_blob != NULL) {
-+        cs_blob->csb_flags &= ~(CS_HARD | CS_KILL);
-+    }
-+
      if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
          sweet_amfi_attach_entitlements(cs_blob);
-     }
+@@ -277,7 +278,6 @@
      return 0;
  }
  
@@ -28,3 +25,29 @@
  /*
   * Policy "Sandbox": libsystem_sandbox calls __mac_syscall("Sandbox", op,
   * arg). Without a policy of that name every call fails with ENOPOLICY and
+@@ -347,11 +347,22 @@
+ }
+ 
+ static int
+-sweet_amfi_vnode_check_exec(__unused kauth_cred_t cred, __unused struct vnode *vp, 
+-    __unused struct label *vlabel, __unused struct label *execlabel, 
++sweet_amfi_vnode_check_exec(__unused kauth_cred_t cred, __unused struct vnode *vp,
++    __unused struct label *vlabel, __unused struct label *execlabel,
+     struct image_params *imgp, __unused struct label *macpolicy_ep)
+ {
+-    if (imgp != NULL) imgp->ip_csflags &= ~(CS_HARD | CS_KILL); return 0;
++    if (imgp != NULL) {
++        /* Strip hard kill flags from the process image */
++        imgp->ip_csflags &= ~(CS_HARD | CS_KILL);
++        
++        /* 
++         * Elevate the running process to a platform binary here during execve.
++         * This satisfies Apple-private userland entitlement checks without 
++         * triggering the kernel's page-hash strictness on mapped libraries.
++         */
++        imgp->ip_csflags |= CS_PLATFORM_BINARY;
++    }
++    return 0;
+ }
+ 
+ 
