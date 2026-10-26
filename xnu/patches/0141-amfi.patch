@@ -26,6 +26,7 @@
 
 
 
+
 --- a/bsd/kern/kern_proc.c
 +++ b/bsd/kern/kern_proc.c
 @@ -3122,6 +3122,17 @@
@@ -46,3 +47,64 @@
  	size_t usize = (size_t)CAST_DOWN(size_t, usersize);
  	proc_t pt;
  	int forself;
+@@ -3202,31 +3213,36 @@
+ #endif
+ 
+ 	switch (ops) {
+-	case CS_OPS_STATUS: {
+-		uint32_t retflags;
+-
+-		proc_lock(pt);
+-		retflags = (uint32_t)proc_getcsflags(pt);
+-		if (cs_process_enforcement(pt)) {
+-			retflags |= CS_ENFORCEMENT;
+-		}
+-		if (csproc_get_platform_binary(pt)) {
+-			retflags |= CS_PLATFORM_BINARY;
+-		}
+-		if (csproc_get_platform_path(pt)) {
+-			retflags |= CS_PLATFORM_PATH;
+-		}
+-		//Don't return CS_REQUIRE_LV if we turned it on with CS_FORCED_LV but still report CS_FORCED_LV
+-		if ((proc_getcsflags(pt) & CS_FORCED_LV) == CS_FORCED_LV) {
+-			retflags &= (~CS_REQUIRE_LV);
+-		}
+-		proc_unlock(pt);
++            case CS_OPS_STATUS: {
++                uint32_t retflags;
+ 
+-		if (uaddr != USER_ADDR_NULL) {
+-			error = copyout(&retflags, uaddr, sizeof(uint32_t));
+-		}
+-		break;
+-	}
++                proc_lock(pt);
++                retflags = (uint32_t)proc_getcsflags(pt);
++                if (cs_process_enforcement(pt)) {
++                        retflags |= CS_ENFORCEMENT;
++                }
++                if (csproc_get_platform_binary(pt)) {
++                        retflags |= CS_PLATFORM_BINARY;
++                }
++                if (csproc_get_platform_path(pt)) {
++                        retflags |= CS_PLATFORM_PATH;
++                }
++                //Don't return CS_REQUIRE_LV if we turned it on with CS_FORCED_LV but still report CS_FORCED_LV
++                if ((proc_getcsflags(pt) & CS_FORCED_LV) == CS_FORCED_LV) {
++                        retflags &= (~CS_REQUIRE_LV);
++                }
++
++                /* SWEET: Strip kill flags and force valid/signed states for userspace queries */
++                retflags &= ~(CS_HARD | CS_KILL);
++                retflags |= (CS_SIGNED | CS_VALID | CS_ENTITLEMENTS_VALIDATED);
++
++                proc_unlock(pt);
++
++                if (uaddr != USER_ADDR_NULL) {
++                        error = copyout(&retflags, uaddr, sizeof(uint32_t));
++                }
++                break;
++        }
+ 	case CS_OPS_MARKINVALID:
+ 		proc_lock(pt);
+ 		if ((proc_getcsflags(pt) & CS_VALID) == CS_VALID) {           /* is currently valid */
