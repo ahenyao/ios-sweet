@@ -22,3 +22,27 @@
  	if (cs_process_enforcement_enable) {
  		return 1;
  	}
+
+
+
+
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3122,6 +3122,17 @@
+ static int
+ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user_addr_t uaudittoken)
+ {
++
++/* 
++     * SWEET: Prevent PosterBoard and other system apps from 
++     * voluntarily elevating their own codesigning strictness.
++     */
++    if (ops == CS_OPS_MARKHARD || ops == CS_OPS_MARKKILL) {
++        return 0; /* Silently acknowledge without applying the fatal flags */
++    }
++
++    /* ... original variable declarations and logic follow ... */
++
+ 	size_t usize = (size_t)CAST_DOWN(size_t, usersize);
+ 	proc_t pt;
+ 	int forself;
