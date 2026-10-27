@@ -666,15 +666,19 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_touch.c
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,85 @@
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/thread.h>
 +#include <kern/clock.h>
++#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +
 +/* External bridge to XNU's HID system */
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++/* Missing external linkage declaration for MMIO mapping */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +/* 
 + * Exynos 2200 HSI2C base address mapping 
