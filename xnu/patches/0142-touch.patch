@@ -1,0 +1,13 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -136,6 +136,10 @@
+ static bool
+ touch_clocks(void)
+ {
++	printf("SWEET TOUCH: bypassing direct GCC clock vote\n");
++	return true;
++
++
+ 	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+ 	uint32_t mask = (0x0fu << 18) | (1u << 23);
+ 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
