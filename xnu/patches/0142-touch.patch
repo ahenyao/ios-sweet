@@ -666,81 +666,497 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_touch.c
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,501 @@
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/thread.h>
 +#include <kern/clock.h>
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
 +
-+/* External bridge to XNU's HID system */
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
-+
-+/* Missing external linkage declaration for MMIO mapping */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void exynos_touch_init(void);
 +
-+/* 
-+ * Exynos 2200 HSI2C base address mapping 
-+ * (Derived from hsi2c@11D00000 found in new.dts)
++/*
++ * Physical addresses for Samsung Galaxy S22 (g0s / s5e9925)
++ * Touch IC: STMicroelectronics fts2ba61y (stm,stm_ts_spi) on spi_2
 + */
-+#define HSI2C_BASE_PHYS     0x11D00000
-+#define HSI2C_MAP_SIZE      0x1000
++#define USI2_SYSREG_PHYS        0x11C22000u
++#define USI2_OFFSET             0x0010u
++#define USI_SPI_SW_CONF         (1u << 1)
 +
-+static vm_offset_t hsi2c_mapped_base = 0;
++#define PINCTRL_PERIC2_PHYS     0x11C30000u
++#define GPP2_CON                0x0040u
++#define GPP2_DAT                0x0044u
++#define GPP2_PUD                0x0048u
++#define GPP2_DRV                0x004Cu
++
++#define PINCTRL_ALIVE_PHYS      0x15850000u
++#define GPA1_CON                0x0020u
++#define GPA1_DAT                0x0024u
++#define GPA1_PUD                0x0028u
++
++#define SPI2_BASE_PHYS          0x11D40000u
++#define MAP_SIZE_4K             0x1000u
++
++/* Exynos S3C64XX SPI register offsets */
++#define SPI_CH_CFG              0x00u
++#define SPI_CLK_CFG             0x04u
++#define SPI_MODE_CFG            0x08u
++#define SPI_SLAVE_SEL           0x0Cu
++#define SPI_INT_EN              0x10u
++#define SPI_STATUS              0x14u
++#define SPI_TX_DATA             0x18u
++#define SPI_RX_DATA             0x1Cu
++#define SPI_PACKET_CNT          0x20u
++#define SPI_PENDING_CLR         0x24u
++#define SPI_SWAP_CFG            0x28u
++#define SPI_FB_CLK              0x2Cu
++#define SPI_USI_CON             0xC4u
++#define SPI_USI_OPTION          0xC8u
++
++#define SPI_CH_SW_RST           (1u << 5)
++#define SPI_CH_RXCH_ON          (1u << 1)
++#define SPI_CH_TXCH_ON          (1u << 0)
++#define SPI_SLAVE_SIG_INACT     (1u << 0)
++#define SPI_PACKET_CNT_EN       (1u << 16)
++#define SPI_TRAILCNT_DEFAULT    (0x3ffu << 19)
++#define SPI_USI_NCS_CONTROL_ON  (1u << 5)
++
++/* STM Touch (stm_ts_spi) protocol constants */
++#define STM_TS_CMD_SENSE_ON             0x10u
++#define STM_TS_CMD_SW_RESET             0x12u
++#define STM_TS_CMD_FORCE_CALIBRATION    0x13u
++#define STM_TS_READ_DEVICE_ID           0x22u
++#define STM_TS_READ_PANEL_INFO          0x23u
++#define STM_TS_CMD_SET_GET_TOUCHTYPE    0x30u
++#define STM_TS_CMD_SET_GET_OPMODE       0x31u
++#define STM_TS_CMD_CLEAR_ALL_EVENT      0x62u
++#define STM_TS_READ_ONE_EVENT           0x87u
++#define STM_TS_READ_ALL_EVENT           0x87u
++#define STM_TS_CMD_SCAN_MODE            0xA0u
++#define STM_TS_CMD_CUSTOM_W             0xC0u
++#define STM_TS_CMD_CUSTOM_R             0xD1u
++#define STM_TS_CMD_REG_W                0xFAu
++#define STM_TS_CMD_REG_R                0xFBu
++
++#define STM_TS_EVENT_BUFF_SIZE          16u
++#define STM_TS_MAX_EVENT_COUNT          31u
++#define STM_TS_COORDINATE_EVENT         0u
++#define STM_TS_STATUS_EVENT             1u
++
++#define STM_TS_ACTION_PRESS             1u
++#define STM_TS_ACTION_MOVE              2u
++#define STM_TS_ACTION_RELEASE           3u
++
++static vm_offset_t usi2_base;
++static vm_offset_t peric2_gpio_base;
++static vm_offset_t alive_gpio_base;
++static vm_offset_t spi2_base;
 +static int touch_sleep_chan;
++static int max_x_coord = 4095;
++static int max_y_coord = 4095;
 +
-+/* Basic MMIO helpers for Exynos HSI2C registers */
-+static inline uint32_t exynos_hsi2c_rd(uint32_t reg) {
-+    return *(volatile uint32_t *)(hsi2c_mapped_base + reg);
++static inline uint32_t
++mmio_rd(vm_offset_t base, uint32_t off)
++{
++    uint32_t v = *(volatile uint32_t *)(base + off);
++    __asm__ volatile("dmb oshld" ::: "memory");
++    return v;
 +}
 +
-+static inline void exynos_hsi2c_wr(uint32_t reg, uint32_t val) {
-+    *(volatile uint32_t *)(hsi2c_mapped_base + reg) = val;
++static inline void
++mmio_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++    __asm__ volatile("dmb oshst" ::: "memory");
++    *(volatile uint32_t *)(base + off) = val;
++    __asm__ volatile("dsb osh" ::: "memory");
 +}
 +
-+/* Background polling thread to read touch events */
-+static void exynos_touch_thread(void *arg, wait_result_t result) {
-+    (void)arg;
-+    (void)result;
++static void
++touch_msleep(unsigned ms)
++{
++    uint64_t deadline;
++    clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++    (void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++    thread_block(THREAD_CONTINUE_NULL);
++}
 +
-+    printf("SWEET EXYNOS TOUCH: Polling thread active.\n");
++static inline void
++spi_cs_set(bool high)
++{
++    uint32_t dat = mmio_rd(peric2_gpio_base, GPP2_DAT);
++    if (high) {
++        dat |= (1u << 3);
++    } else {
++        dat &= ~(1u << 3);
++    }
++    mmio_wr(peric2_gpio_base, GPP2_DAT, dat);
++    mmio_wr(spi2_base, SPI_SLAVE_SEL, high ? SPI_SLAVE_SIG_INACT : 0u);
++}
 +
-+    while (1) {
-+        /*
-+         * TODO: Implement low-level HSI2C transaction to read 
-+         * from I2C address 0x48 (touchscreen@48) at register 0x60 (SEC_TS_READ_ONE_EVENT).
-+         * 
-+         * Once the 8-byte packet is read:
-+         * uint8_t event_buf[8];
-+         * // perform i2c read...
-+         * 
-+         * int tid = event_buf[0] & 0x0F;
-+         * int action = (event_buf[0] >> 6) & 0x03; // press/move/release
-+         * int x = (event_buf[1] << 4) | (event_buf[3] & 0x0F);
-+         * int y = (event_buf[2] << 4) | (event_buf[3] >> 4);
-+         * int is_down = (action != 3); // 3 is release
-+         * 
-+         * sweet_hid_touch(tid, is_down, x, y);
-+         */
++static void
++exynos_spi2_hwinit(void)
++{
++    /* 1. Ensure USI2 is in SPI mode */
++    uint32_t usi = mmio_rd(usi2_base, USI2_OFFSET);
++    if ((usi & 0x7u) != USI_SPI_SW_CONF) {
++        mmio_wr(usi2_base, USI2_OFFSET, (usi & ~0x7u) | USI_SPI_SW_CONF);
++    }
 +
-+        /* Poll interval: 10ms */
-+        uint64_t deadline;
-+        clock_interval_to_deadline(10, NSEC_PER_MSEC, &deadline);
-+        (void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
-+        thread_block(THREAD_CONTINUE_NULL);
++    /*
++     * 2. Configure GPP2 pins:
++     * gpp2-0 (CLK), gpp2-1 (MOSI), gpp2-2 (MISO) -> func 2 (SPI)
++     * gpp2-3 (CS) -> func 1 (GPIO output, idle high)
++     */
++    uint32_t dat = mmio_rd(peric2_gpio_base, GPP2_DAT);
++    mmio_wr(peric2_gpio_base, GPP2_DAT, dat | (1u << 3));
++
++    uint32_t con = mmio_rd(peric2_gpio_base, GPP2_CON);
++    con = (con & ~0xffffu) | 0x1222u;
++    mmio_wr(peric2_gpio_base, GPP2_CON, con);
++
++    uint32_t pud = mmio_rd(peric2_gpio_base, GPP2_PUD);
++    mmio_wr(peric2_gpio_base, GPP2_PUD, pud & ~0xffffu);
++
++    /* 3. Release USI_RESET on SPI2 and configure NCS control */
++    mmio_wr(spi2_base, SPI_USI_CON, 0u);
++    mmio_wr(spi2_base, SPI_USI_OPTION,
++        mmio_rd(spi2_base, SPI_USI_OPTION) | SPI_USI_NCS_CONTROL_ON);
++
++    /* 4. Initialize S3C64XX SPI2 registers for polled byte-mode transfers */
++    mmio_wr(spi2_base, SPI_SLAVE_SEL, SPI_SLAVE_SIG_INACT);
++    mmio_wr(spi2_base, SPI_INT_EN, 0u);
++    mmio_wr(spi2_base, SPI_MODE_CFG, SPI_TRAILCNT_DEFAULT);
++    mmio_wr(spi2_base, SPI_PACKET_CNT, 0u);
++    mmio_wr(spi2_base, SPI_PENDING_CLR, 0x1fu);
++    mmio_wr(spi2_base, SPI_PENDING_CLR, 0u);
++    mmio_wr(spi2_base, SPI_SWAP_CFG, 0u);
++    mmio_wr(spi2_base, SPI_FB_CLK, 0u);
++
++    /* Flush FIFOs */
++    mmio_wr(spi2_base, SPI_CH_CFG, SPI_CH_SW_RST);
++    delay(10);
++    mmio_wr(spi2_base, SPI_CH_CFG, 0u);
++}
++
++static int
++exynos_spi2_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++    if (len == 0 || len > 256) {
++        return -1;
++    }
++
++    /* Reset FIFOs before packet transfer */
++    mmio_wr(spi2_base, SPI_CH_CFG, SPI_CH_SW_RST);
++    delay(1);
++    mmio_wr(spi2_base, SPI_CH_CFG, 0u);
++
++    mmio_wr(spi2_base, SPI_MODE_CFG, SPI_TRAILCNT_DEFAULT);
++    mmio_wr(spi2_base, SPI_PACKET_CNT, 0u);
++    mmio_wr(spi2_base, SPI_PACKET_CNT, (len & 0xffffu) | SPI_PACKET_CNT_EN);
++
++    spi_cs_set(false);
++    delay(2);
++
++    /* Fill TX FIFO (256-byte depth) */
++    for (unsigned i = 0; i < len; i++) {
++        mmio_wr(spi2_base, SPI_TX_DATA, tx ? (uint32_t)tx[i] : 0u);
++    }
++
++    /* Start clock generation (SPI_MODE_0: CPOL=0, CPHA=0) */
++    mmio_wr(spi2_base, SPI_CH_CFG, SPI_CH_RXCH_ON | SPI_CH_TXCH_ON);
++
++    /* Wait for RX FIFO to receive all bytes (bits [23:15] = RX_FIFO_LVL) */
++    int err = -1;
++    for (unsigned Polls = 0; Polls < 2000; Polls++) {
++        uint32_t status = mmio_rd(spi2_base, SPI_STATUS);
++        uint32_t rx_lvl = (status >> 15) & 0x1ffu;
++        if (rx_lvl >= len) {
++            err = 0;
++            break;
++        }
++        delay(1);
++    }
++
++    /* Read out len bytes from RX FIFO */
++    for (unsigned i = 0; i < len; i++) {
++        uint8_t b = (uint8_t)mmio_rd(spi2_base, SPI_RX_DATA);
++        if (rx) {
++            rx[i] = b;
++        }
++    }
++
++    mmio_wr(spi2_base, SPI_CH_CFG, 0u);
++    spi_cs_set(true);
++    delay(10);
++
++    return err;
++}
++
++static int
++stm_spi_write(const uint8_t *reg, unsigned tlen, const uint8_t *data, unsigned len)
++{
++    uint8_t tx_buf[64];
++    unsigned wlen = 0;
++
++    if (tlen == 0 || (tlen + len + 1) > sizeof(tx_buf)) {
++        return -1;
++    }
++
++    switch (reg[0]) {
++    case STM_TS_CMD_SCAN_MODE:
++    case 0xA2u:
++    case 0xA4u:
++    case 0xA7u:
++    case STM_TS_CMD_REG_W:
++    case STM_TS_CMD_REG_R:
++    case 0xD0u:
++        memcpy(tx_buf, reg, tlen);
++        if (len && data) {
++            memcpy(&tx_buf[tlen], data, len);
++        }
++        wlen = tlen + len;
++        break;
++    default:
++        tx_buf[0] = STM_TS_CMD_CUSTOM_W;
++        memcpy(&tx_buf[1], reg, tlen);
++        if (len && data) {
++            memcpy(&tx_buf[1 + tlen], data, len);
++        }
++        wlen = tlen + len + 1;
++        break;
++    }
++
++    return exynos_spi2_xfer(tx_buf, NULL, wlen);
++}
++
++static int
++stm_spi_read(const uint8_t *reg, unsigned tlen, uint8_t *buf, unsigned rlen)
++{
++    uint8_t tx_buf[256];
++    uint8_t rx_buf[256];
++    uint8_t hdr[5] = { 0 };
++    unsigned buf_len = tlen;
++    bool need_pre_write = false;
++
++    if (tlen == 0 || tlen > 5) {
++        return -1;
++    }
++
++    switch (reg[0]) {
++    case STM_TS_READ_ONE_EVENT:
++    case 0xA7u:
++    case 0xA4u:
++    case STM_TS_CMD_REG_W:
++    case STM_TS_CMD_REG_R:
++        memcpy(hdr, reg, tlen);
++        need_pre_write = false;
++        break;
++    default:
++        buf_len = 3;
++        hdr[0] = STM_TS_CMD_CUSTOM_R;
++        hdr[1] = 0x00;
++        hdr[2] = 0x00;
++        need_pre_write = true;
++        break;
++    }
++
++    unsigned total_len = rlen + 1 + buf_len;
++    if (total_len > sizeof(tx_buf)) {
++        return -1;
++    }
++
++    if (need_pre_write) {
++        int err = stm_spi_write(reg, tlen, NULL, 0);
++        if (err < 0) {
++            return err;
++        }
++        delay(15);
++    }
++
++    memset(tx_buf, 0, total_len);
++    memset(rx_buf, 0, total_len);
++    memcpy(tx_buf, hdr, buf_len);
++
++    int err = exynos_spi2_xfer(tx_buf, rx_buf, total_len);
++    if (err == 0 && buf) {
++        memcpy(buf, &rx_buf[1 + buf_len], rlen);
++    }
++    return err;
++}
++
++static void
++stm_wire_mode_init(void)
++{
++    static const struct {
++        uint8_t addr;
++        uint8_t val;
++        unsigned wait_ms;
++    } seq[] = {
++        { 0x32, 0x10, 2 },
++        { 0x34, 0x02, 2 },
++        { 0x3E, 0x07, 2 }, /* STM_REG_MISO_PORT_SETTING */
++        { 0x3D, 0x30, 2 },
++        { 0x2D, 0x02, 15 },
++        { 0x1B, 0x66, 30 },
++        { 0x68, 0x13, 30 },
++    };
++
++    for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
++        uint8_t cmd[6] = { STM_TS_CMD_REG_W, 0x20, 0x00, 0x00, seq[i].addr, seq[i].val };
++        (void)stm_spi_write(cmd, sizeof(cmd), NULL, 0);
++        touch_msleep(seq[i].wait_ms);
 +    }
 +}
 +
-+void exynos_touch_init(void) {
++static void
++stm_process_event(const uint8_t *ev)
++{
++    if (ev[0] == 0x00 || ev[0] == 0xFF) {
++        return;
++    }
++
++    uint8_t eid = ev[0] & 0x03u;
++    if (eid != STM_TS_COORDINATE_EVENT) {
++        return;
++    }
++
++    int tid = (ev[0] >> 2) & 0x0Fu;
++    int tchsta = (ev[0] >> 6) & 0x03u;
++    if (tid < 0 || tid >= 10) {
++        return;
++    }
++
++    /*
++     * struct stm_ts_event_coordinate bit layout:
++     * ev[1] = x_11_4, ev[2] = y_11_4, ev[3][3:0] = y_3_0, ev[3][7:4] = x_3_0
++     */
++    int raw_x = ((int)ev[1] << 4) | ((ev[3] >> 4) & 0x0Fu);
++    int raw_y = ((int)ev[2] << 4) | (ev[3] & 0x0Fu);
++
++    int x = (raw_x * 1080) / (max_x_coord + 1);
++    int y = (raw_y * 2400) / (max_y_coord + 1);
++
++    if (tchsta == STM_TS_ACTION_PRESS || tchsta == STM_TS_ACTION_MOVE) {
++        sweet_hid_touch(tid, 1, x, y);
++    } else if (tchsta == STM_TS_ACTION_RELEASE) {
++        sweet_hid_touch(tid, 0, x, y);
++    }
++}
++
++static void
++exynos_touch_thread(void *arg, wait_result_t result)
++{
++    (void)arg;
++    (void)result;
++
++    unsigned delay_s = 5;
++    (void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++    printf("SWEET EXYNOS TOUCH: starting in %u s\n", delay_s);
++    touch_msleep(delay_s * 1000u);
++
++    printf("SWEET EXYNOS TOUCH: pre-init usi2=%#x gpp2_con=%#x gpp2_dat=%#x gpa1_dat=%#x spi_status=%#x\n",
++        mmio_rd(usi2_base, USI2_OFFSET),
++        mmio_rd(peric2_gpio_base, GPP2_CON),
++        mmio_rd(peric2_gpio_base, GPP2_DAT),
++        mmio_rd(alive_gpio_base, GPA1_DAT),
++        mmio_rd(spi2_base, SPI_STATUS));
++
++    exynos_spi2_hwinit();
++    stm_wire_mode_init();
++
++    uint8_t hw_id_cmd[5] = { STM_TS_CMD_REG_R, 0x20, 0x00, 0x00, 0x00 };
++    uint8_t hw_id[8] = { 0 };
++    int hw_err = stm_spi_read(hw_id_cmd, sizeof(hw_id_cmd), hw_id, sizeof(hw_id));
++    printf("SWEET EXYNOS TOUCH: hw_id err=%d: %02x %02x %02x %02x %02x %02x %02x %02x (spi_status=%#x)\n",
++        hw_err, hw_id[0], hw_id[1], hw_id[2], hw_id[3],
++        hw_id[4], hw_id[5], hw_id[6], hw_id[7],
++        mmio_rd(spi2_base, SPI_STATUS));
++
++    uint8_t dev_id_cmd = STM_TS_READ_DEVICE_ID;
++    uint8_t dev_id[5] = { 0 };
++    int id_err = stm_spi_read(&dev_id_cmd, 1, dev_id, sizeof(dev_id));
++    printf("SWEET EXYNOS TOUCH: dev_id err=%d: %02x %02x %02x %02x %02x\n",
++        id_err, dev_id[0], dev_id[1], dev_id[2], dev_id[3], dev_id[4]);
++
++    uint8_t panel_cmd = STM_TS_READ_PANEL_INFO;
++    uint8_t panel_info[11] = { 0 };
++    if (stm_spi_read(&panel_cmd, 1, panel_info, sizeof(panel_info)) == 0) {
++        int rx_res = ((int)panel_info[0] << 8) | panel_info[1];
++        int ry_res = ((int)panel_info[2] << 8) | panel_info[3];
++        printf("SWEET EXYNOS TOUCH: panel res=%dx%d tx=%u rx=%u\n",
++            rx_res, ry_res, panel_info[8], panel_info[9]);
++        if (rx_res > 0 && rx_res <= 4096 && ry_res > 0 && ry_res <= 4096) {
++            max_x_coord = rx_res;
++            max_y_coord = ry_res;
++        }
++    }
++
++    /* Enable touch functions, clear FIFO, turn sense on, and start scanning */
++    uint8_t touch_func_cmd[3] = { STM_TS_CMD_SET_GET_TOUCHTYPE, 0x61, 0x00 };
++    (void)stm_spi_write(touch_func_cmd, sizeof(touch_func_cmd), NULL, 0);
++    touch_msleep(10);
++
++    uint8_t clear_cmd = STM_TS_CMD_CLEAR_ALL_EVENT;
++    (void)stm_spi_write(&clear_cmd, 1, NULL, 0);
++    touch_msleep(10);
++
++    uint8_t sense_on_cmd = STM_TS_CMD_SENSE_ON;
++    (void)stm_spi_write(&sense_on_cmd, 1, NULL, 0);
++    touch_msleep(20);
++
++    uint8_t scan_cmd[3] = { STM_TS_CMD_SCAN_MODE, 0x00, 0x01 };
++    (void)stm_spi_write(scan_cmd, sizeof(scan_cmd), NULL, 0);
++    touch_msleep(20);
++
++    printf("SWEET EXYNOS TOUCH: polling active (max_coords=%dx%d)\n",
++        max_x_coord, max_y_coord);
++
++    uint8_t one_event[STM_TS_EVENT_BUFF_SIZE];
++    uint8_t all_events[8 * STM_TS_EVENT_BUFF_SIZE];
++    uint8_t read_evt_cmd = STM_TS_READ_ONE_EVENT;
++
++    for (;;) {
++        memset(one_event, 0, sizeof(one_event));
++        if (stm_spi_read(&read_evt_cmd, 1, one_event, STM_TS_EVENT_BUFF_SIZE) == 0) {
++            if (one_event[0] != 0x00 && one_event[0] != 0xFF) {
++                stm_process_event(one_event);
++
++                unsigned left = one_event[7] & 0x1Fu;
++                if (left > 0 && left <= 8) {
++                    if (stm_spi_read(&read_evt_cmd, 1, all_events, left * STM_TS_EVENT_BUFF_SIZE) == 0) {
++                        for (unsigned i = 0; i < left; i++) {
++                            stm_process_event(&all_events[i * STM_TS_EVENT_BUFF_SIZE]);
++                        }
++                    }
++                } else if (left >= STM_TS_MAX_EVENT_COUNT) {
++                    (void)stm_spi_write(&clear_cmd, 1, NULL, 0);
++                }
++            }
++        }
++
++        touch_msleep(8);
++    }
++}
++
++void
++exynos_touch_init(void)
++{
 +    kern_return_t kr;
 +    thread_t thread;
 +
-+    printf("SWEET EXYNOS TOUCH: Mapping HSI2C registers at %#x...\n", HSI2C_BASE_PHYS);
-+    
-+    hsi2c_mapped_base = ml_io_map(HSI2C_BASE_PHYS, HSI2C_MAP_SIZE);
-+    if (!hsi2c_mapped_base) {
-+        printf("SWEET EXYNOS TOUCH: Failed to map HSI2C MMIO space!\n");
++    printf("SWEET EXYNOS TOUCH: Mapping USI2, GPIO, and SPI2 registers...\n");
++
++    usi2_base = ml_io_map(USI2_SYSREG_PHYS, MAP_SIZE_4K);
++    peric2_gpio_base = ml_io_map(PINCTRL_PERIC2_PHYS, MAP_SIZE_4K);
++    alive_gpio_base = ml_io_map(PINCTRL_ALIVE_PHYS, MAP_SIZE_4K);
++    spi2_base = ml_io_map(SPI2_BASE_PHYS, MAP_SIZE_4K);
++
++    if (!usi2_base || !peric2_gpio_base || !alive_gpio_base || !spi2_base) {
++        printf("SWEET EXYNOS TOUCH: Failed to map MMIO spaces!\n");
 +        return;
 +    }
 +
@@ -752,7 +1168,6 @@
 +        printf("SWEET EXYNOS TOUCH: Failed to spawn thread (%d)\n", kr);
 +    }
 +}
-
 
 
 --- a/bsd/dev/sweet_ufs.c
