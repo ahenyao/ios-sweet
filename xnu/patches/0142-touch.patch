@@ -666,7 +666,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_touch.c
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,486 @@
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/thread.h>
@@ -681,12 +681,13 @@
 +
 +/*
 + * Physical addresses for Samsung Galaxy S22 (g0s / s5e9925)
-+ * Touch IC: STMicroelectronics fts2ba61y (stm,stm_ts_spi) on spi_2
++ * Touch IC: STMicroelectronics fts2ba61y (stm,stm_ts_spi) on GPP2 (SPI2)
++ *   gpp2-0: SPI SCLK (Output)
++ *   gpp2-1: SPI MOSI (Output)
++ *   gpp2-2: SPI MISO (Input)
++ *   gpp2-3: SPI CS   (Output, active low)
++ *   gpa1-2: TSP_INT  (Input, active low)
 + */
-+#define USI2_SYSREG_PHYS        0x11C22000u
-+#define USI2_OFFSET             0x0010u
-+#define USI_SPI_SW_CONF         (1u << 1)
-+
 +#define PINCTRL_PERIC2_PHYS     0x11C30000u
 +#define GPP2_CON                0x0040u
 +#define GPP2_DAT                0x0044u
@@ -698,44 +699,20 @@
 +#define GPA1_DAT                0x0024u
 +#define GPA1_PUD                0x0028u
 +
-+#define SPI2_BASE_PHYS          0x11D40000u
 +#define MAP_SIZE_4K             0x1000u
 +
-+/* Exynos S3C64XX SPI register offsets */
-+#define SPI_CH_CFG              0x00u
-+#define SPI_CLK_CFG             0x04u
-+#define SPI_MODE_CFG            0x08u
-+#define SPI_SLAVE_SEL           0x0Cu
-+#define SPI_INT_EN              0x10u
-+#define SPI_STATUS              0x14u
-+#define SPI_TX_DATA             0x18u
-+#define SPI_RX_DATA             0x1Cu
-+#define SPI_PACKET_CNT          0x20u
-+#define SPI_PENDING_CLR         0x24u
-+#define SPI_SWAP_CFG            0x28u
-+#define SPI_FB_CLK              0x2Cu
-+#define SPI_USI_CON             0xC4u
-+#define SPI_USI_OPTION          0xC8u
-+
-+#define SPI_CH_SW_RST           (1u << 5)
-+#define SPI_CH_RXCH_ON          (1u << 1)
-+#define SPI_CH_TXCH_ON          (1u << 0)
-+#define SPI_SLAVE_SIG_INACT     (1u << 0)
-+#define SPI_PACKET_CNT_EN       (1u << 16)
-+#define SPI_TRAILCNT_DEFAULT    (0x3ffu << 19)
-+#define SPI_USI_NCS_CONTROL_ON  (1u << 5)
++#define PIN_SCLK                (1u << 0)
++#define PIN_MOSI                (1u << 1)
++#define PIN_MISO                (1u << 2)
++#define PIN_CS                  (1u << 3)
 +
 +/* STM Touch (stm_ts_spi) protocol constants */
 +#define STM_TS_CMD_SENSE_ON             0x10u
-+#define STM_TS_CMD_SW_RESET             0x12u
-+#define STM_TS_CMD_FORCE_CALIBRATION    0x13u
 +#define STM_TS_READ_DEVICE_ID           0x22u
 +#define STM_TS_READ_PANEL_INFO          0x23u
 +#define STM_TS_CMD_SET_GET_TOUCHTYPE    0x30u
-+#define STM_TS_CMD_SET_GET_OPMODE       0x31u
 +#define STM_TS_CMD_CLEAR_ALL_EVENT      0x62u
 +#define STM_TS_READ_ONE_EVENT           0x87u
-+#define STM_TS_READ_ALL_EVENT           0x87u
 +#define STM_TS_CMD_SCAN_MODE            0xA0u
 +#define STM_TS_CMD_CUSTOM_W             0xC0u
 +#define STM_TS_CMD_CUSTOM_R             0xD1u
@@ -745,19 +722,17 @@
 +#define STM_TS_EVENT_BUFF_SIZE          16u
 +#define STM_TS_MAX_EVENT_COUNT          31u
 +#define STM_TS_COORDINATE_EVENT         0u
-+#define STM_TS_STATUS_EVENT             1u
 +
 +#define STM_TS_ACTION_PRESS             1u
 +#define STM_TS_ACTION_MOVE              2u
 +#define STM_TS_ACTION_RELEASE           3u
 +
-+static vm_offset_t usi2_base;
 +static vm_offset_t peric2_gpio_base;
 +static vm_offset_t alive_gpio_base;
-+static vm_offset_t spi2_base;
 +static int touch_sleep_chan;
 +static int max_x_coord = 4095;
 +static int max_y_coord = 4095;
++static unsigned debug_event_logs = 25;
 +
 +static inline uint32_t
 +mmio_rd(vm_offset_t base, uint32_t off)
@@ -785,115 +760,100 @@
 +}
 +
 +static inline void
-+spi_cs_set(bool high)
++spi_delay_short(void)
 +{
-+    uint32_t dat = mmio_rd(peric2_gpio_base, GPP2_DAT);
-+    if (high) {
-+        dat |= (1u << 3);
-+    } else {
-+        dat &= ~(1u << 3);
++    for (int i = 0; i < 4; i++) {
++        (void)mmio_rd(peric2_gpio_base, GPP2_DAT);
 +    }
-+    mmio_wr(peric2_gpio_base, GPP2_DAT, dat);
-+    mmio_wr(spi2_base, SPI_SLAVE_SEL, high ? SPI_SLAVE_SIG_INACT : 0u);
 +}
 +
 +static void
-+exynos_spi2_hwinit(void)
++exynos_gpio_spi_init(void)
 +{
-+    /* 1. Ensure USI2 is in SPI mode */
-+    uint32_t usi = mmio_rd(usi2_base, USI2_OFFSET);
-+    if ((usi & 0x7u) != USI_SPI_SW_CONF) {
-+        mmio_wr(usi2_base, USI2_OFFSET, (usi & ~0x7u) | USI_SPI_SW_CONF);
-+    }
++    /* Set CS high, SCLK low, MOSI low before switching direction */
++    uint32_t dat = mmio_rd(peric2_gpio_base, GPP2_DAT);
++    dat = (dat & ~0x0fu) | PIN_CS;
++    mmio_wr(peric2_gpio_base, GPP2_DAT, dat);
 +
 +    /*
-+     * 2. Configure GPP2 pins:
-+     * gpp2-0 (CLK), gpp2-1 (MOSI), gpp2-2 (MISO) -> func 2 (SPI)
-+     * gpp2-3 (CS) -> func 1 (GPIO output, idle high)
++     * Configure GPP2_CON:
++     *   gpp2-0 (SCLK) = 0x1 (Output)
++     *   gpp2-1 (MOSI) = 0x1 (Output)
++     *   gpp2-2 (MISO) = 0x0 (Input)
++     *   gpp2-3 (CS)   = 0x1 (Output)
 +     */
-+    uint32_t dat = mmio_rd(peric2_gpio_base, GPP2_DAT);
-+    mmio_wr(peric2_gpio_base, GPP2_DAT, dat | (1u << 3));
-+
 +    uint32_t con = mmio_rd(peric2_gpio_base, GPP2_CON);
-+    con = (con & ~0xffffu) | 0x1222u;
++    con = (con & ~0xffffu) | 0x1011u;
 +    mmio_wr(peric2_gpio_base, GPP2_CON, con);
 +
++    /* Enable pull-up (0x3) on MISO (gpp2-2), no pull on SCLK/MOSI/CS */
 +    uint32_t pud = mmio_rd(peric2_gpio_base, GPP2_PUD);
-+    mmio_wr(peric2_gpio_base, GPP2_PUD, pud & ~0xffffu);
++    pud = (pud & ~0xffffu) | 0x0300u;
++    mmio_wr(peric2_gpio_base, GPP2_PUD, pud);
 +
-+    /* 3. Release USI_RESET on SPI2 and configure NCS control */
-+    mmio_wr(spi2_base, SPI_USI_CON, 0u);
-+    mmio_wr(spi2_base, SPI_USI_OPTION,
-+        mmio_rd(spi2_base, SPI_USI_OPTION) | SPI_USI_NCS_CONTROL_ON);
++    /* Set drive strength on GPP2 pins */
++    uint32_t drv = mmio_rd(peric2_gpio_base, GPP2_DRV);
++    drv = (drv & ~0xffffu) | 0x2222u;
++    mmio_wr(peric2_gpio_base, GPP2_DRV, drv);
 +
-+    /* 4. Initialize S3C64XX SPI2 registers for polled byte-mode transfers */
-+    mmio_wr(spi2_base, SPI_SLAVE_SEL, SPI_SLAVE_SIG_INACT);
-+    mmio_wr(spi2_base, SPI_INT_EN, 0u);
-+    mmio_wr(spi2_base, SPI_MODE_CFG, SPI_TRAILCNT_DEFAULT);
-+    mmio_wr(spi2_base, SPI_PACKET_CNT, 0u);
-+    mmio_wr(spi2_base, SPI_PENDING_CLR, 0x1fu);
-+    mmio_wr(spi2_base, SPI_PENDING_CLR, 0u);
-+    mmio_wr(spi2_base, SPI_SWAP_CFG, 0u);
-+    mmio_wr(spi2_base, SPI_FB_CLK, 0u);
++    /* Ensure pull-up is enabled on GPA1-2 (touch IRQ) */
++    uint32_t gpa1_pud = mmio_rd(alive_gpio_base, GPA1_PUD);
++    gpa1_pud = (gpa1_pud & ~0x0f00u) | 0x0300u;
++    mmio_wr(alive_gpio_base, GPA1_PUD, gpa1_pud);
 +
-+    /* Flush FIFOs */
-+    mmio_wr(spi2_base, SPI_CH_CFG, SPI_CH_SW_RST);
 +    delay(10);
-+    mmio_wr(spi2_base, SPI_CH_CFG, 0u);
 +}
 +
++/*
++ * Bit-banged SPI Mode 0 (CPOL=0, CPHA=0) full-duplex transfer on GPP2
++ */
 +static int
-+exynos_spi2_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++exynos_spi_bitbang_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
 +{
 +    if (len == 0 || len > 256) {
 +        return -1;
 +    }
 +
-+    /* Reset FIFOs before packet transfer */
-+    mmio_wr(spi2_base, SPI_CH_CFG, SPI_CH_SW_RST);
-+    delay(1);
-+    mmio_wr(spi2_base, SPI_CH_CFG, 0u);
++    uint32_t base_dat = mmio_rd(peric2_gpio_base, GPP2_DAT) & ~0x0fu;
 +
-+    mmio_wr(spi2_base, SPI_MODE_CFG, SPI_TRAILCNT_DEFAULT);
-+    mmio_wr(spi2_base, SPI_PACKET_CNT, 0u);
-+    mmio_wr(spi2_base, SPI_PACKET_CNT, (len & 0xffffu) | SPI_PACKET_CNT_EN);
-+
-+    spi_cs_set(false);
++    /* Assert CS low (SCLK=0, MOSI=0, CS=0) */
++    mmio_wr(peric2_gpio_base, GPP2_DAT, base_dat);
 +    delay(2);
 +
-+    /* Fill TX FIFO (256-byte depth) */
 +    for (unsigned i = 0; i < len; i++) {
-+        mmio_wr(spi2_base, SPI_TX_DATA, tx ? (uint32_t)tx[i] : 0u);
-+    }
++        uint8_t out_b = tx ? tx[i] : 0u;
++        uint8_t in_b = 0u;
 +
-+    /* Start clock generation (SPI_MODE_0: CPOL=0, CPHA=0) */
-+    mmio_wr(spi2_base, SPI_CH_CFG, SPI_CH_RXCH_ON | SPI_CH_TXCH_ON);
++        for (int bit = 7; bit >= 0; bit--) {
++            uint32_t mosi = ((out_b >> bit) & 1u) ? PIN_MOSI : 0u;
 +
-+    /* Wait for RX FIFO to receive all bytes (bits [23:15] = RX_FIFO_LVL) */
-+    int err = -1;
-+    for (unsigned Polls = 0; Polls < 2000; Polls++) {
-+        uint32_t status = mmio_rd(spi2_base, SPI_STATUS);
-+        uint32_t rx_lvl = (status >> 15) & 0x1ffu;
-+        if (rx_lvl >= len) {
-+            err = 0;
-+            break;
++            /* Setup MOSI with SCLK low */
++            mmio_wr(peric2_gpio_base, GPP2_DAT, base_dat | mosi);
++            spi_delay_short();
++
++            /* Rising edge of SCLK: sample MISO */
++            mmio_wr(peric2_gpio_base, GPP2_DAT, base_dat | mosi | PIN_SCLK);
++            spi_delay_short();
++            uint32_t pin_in = mmio_rd(peric2_gpio_base, GPP2_DAT);
++            if (pin_in & PIN_MISO) {
++                in_b |= (uint8_t)(1u << bit);
++            }
++
++            /* Falling edge of SCLK */
++            mmio_wr(peric2_gpio_base, GPP2_DAT, base_dat | mosi);
 +        }
-+        delay(1);
-+    }
 +
-+    /* Read out len bytes from RX FIFO */
-+    for (unsigned i = 0; i < len; i++) {
-+        uint8_t b = (uint8_t)mmio_rd(spi2_base, SPI_RX_DATA);
 +        if (rx) {
-+            rx[i] = b;
++            rx[i] = in_b;
 +        }
 +    }
 +
-+    mmio_wr(spi2_base, SPI_CH_CFG, 0u);
-+    spi_cs_set(true);
-+    delay(10);
++    delay(2);
++    /* Deassert CS high (SCLK=0, MOSI=0, CS=1) */
++    mmio_wr(peric2_gpio_base, GPP2_DAT, base_dat | PIN_CS);
++    delay(15);
 +
-+    return err;
++    return 0;
 +}
 +
 +static int
@@ -930,7 +890,7 @@
 +        break;
 +    }
 +
-+    return exynos_spi2_xfer(tx_buf, NULL, wlen);
++    return exynos_spi_bitbang_xfer(tx_buf, NULL, wlen);
 +}
 +
 +static int
@@ -974,14 +934,14 @@
 +        if (err < 0) {
 +            return err;
 +        }
-+        delay(15);
++        delay(20);
 +    }
 +
 +    memset(tx_buf, 0, total_len);
 +    memset(rx_buf, 0, total_len);
 +    memcpy(tx_buf, hdr, buf_len);
 +
-+    int err = exynos_spi2_xfer(tx_buf, rx_buf, total_len);
++    int err = exynos_spi_bitbang_xfer(tx_buf, rx_buf, total_len);
 +    if (err == 0 && buf) {
 +        memcpy(buf, &rx_buf[1 + buf_len], rlen);
 +    }
@@ -989,7 +949,7 @@
 +}
 +
 +static void
-+stm_wire_mode_init(void)
++stm_wire_mode_and_reset(void)
 +{
 +    static const struct {
 +        uint8_t addr;
@@ -1010,6 +970,20 @@
 +        (void)stm_spi_write(cmd, sizeof(cmd), NULL, 0);
 +        touch_msleep(seq[i].wait_ms);
 +    }
++
++    /* Wait for STM firmware to finish booting after system reset */
++    uint8_t read_evt_cmd = STM_TS_READ_ONE_EVENT;
++    uint8_t ev[STM_TS_EVENT_BUFF_SIZE];
++    for (int retry = 0; retry < 25; retry++) {
++        memset(ev, 0, sizeof(ev));
++        (void)stm_spi_read(&read_evt_cmd, 1, ev, sizeof(ev));
++        if (ev[0] == 0x43 && ev[1] == 0x00) {
++            printf("SWEET EXYNOS TOUCH: IC ready event received (%02x %02x %02x %02x)\n",
++                ev[0], ev[1], ev[2], ev[3]);
++            break;
++        }
++        touch_msleep(20);
++    }
 +}
 +
 +static void
@@ -1017,6 +991,12 @@
 +{
 +    if (ev[0] == 0x00 || ev[0] == 0xFF) {
 +        return;
++    }
++
++    if (debug_event_logs > 0) {
++        debug_event_logs--;
++        printf("SWEET EXYNOS TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
++            ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
 +    }
 +
 +    uint8_t eid = ev[0] & 0x03u;
@@ -1030,10 +1010,6 @@
 +        return;
 +    }
 +
-+    /*
-+     * struct stm_ts_event_coordinate bit layout:
-+     * ev[1] = x_11_4, ev[2] = y_11_4, ev[3][3:0] = y_3_0, ev[3][7:4] = x_3_0
-+     */
 +    int raw_x = ((int)ev[1] << 4) | ((ev[3] >> 4) & 0x0Fu);
 +    int raw_y = ((int)ev[2] << 4) | (ev[3] & 0x0Fu);
 +
@@ -1058,29 +1034,40 @@
 +    printf("SWEET EXYNOS TOUCH: starting in %u s\n", delay_s);
 +    touch_msleep(delay_s * 1000u);
 +
-+    printf("SWEET EXYNOS TOUCH: pre-init usi2=%#x gpp2_con=%#x gpp2_dat=%#x gpa1_dat=%#x spi_status=%#x\n",
-+        mmio_rd(usi2_base, USI2_OFFSET),
++    exynos_gpio_spi_init();
++
++    printf("SWEET EXYNOS TOUCH: post-gpio-init gpp2_con=%#x gpp2_dat=%#x gpa1_dat=%#x\n",
 +        mmio_rd(peric2_gpio_base, GPP2_CON),
 +        mmio_rd(peric2_gpio_base, GPP2_DAT),
-+        mmio_rd(alive_gpio_base, GPA1_DAT),
-+        mmio_rd(spi2_base, SPI_STATUS));
++        mmio_rd(alive_gpio_base, GPA1_DAT));
 +
-+    exynos_spi2_hwinit();
-+    stm_wire_mode_init();
++    /* Configure MISO port setting (0x3E = 0x07) first without resetting MCU */
++    uint8_t miso_cmd[6] = { STM_TS_CMD_REG_W, 0x20, 0x00, 0x00, 0x3E, 0x07 };
++    (void)stm_spi_write(miso_cmd, sizeof(miso_cmd), NULL, 0);
++    touch_msleep(5);
 +
 +    uint8_t hw_id_cmd[5] = { STM_TS_CMD_REG_R, 0x20, 0x00, 0x00, 0x00 };
 +    uint8_t hw_id[8] = { 0 };
-+    int hw_err = stm_spi_read(hw_id_cmd, sizeof(hw_id_cmd), hw_id, sizeof(hw_id));
-+    printf("SWEET EXYNOS TOUCH: hw_id err=%d: %02x %02x %02x %02x %02x %02x %02x %02x (spi_status=%#x)\n",
-+        hw_err, hw_id[0], hw_id[1], hw_id[2], hw_id[3],
-+        hw_id[4], hw_id[5], hw_id[6], hw_id[7],
-+        mmio_rd(spi2_base, SPI_STATUS));
++    (void)stm_spi_read(hw_id_cmd, sizeof(hw_id_cmd), hw_id, sizeof(hw_id));
++    printf("SWEET EXYNOS TOUCH: pre-reset hw_id: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++        hw_id[0], hw_id[1], hw_id[2], hw_id[3],
++        hw_id[4], hw_id[5], hw_id[6], hw_id[7]);
++
++    /* Run full STM wire-mode init + system reset if chip did not respond yet */
++    if ((hw_id[0] == 0x00 && hw_id[1] == 0x00) || (hw_id[0] == 0xFF && hw_id[1] == 0xFF)) {
++        printf("SWEET EXYNOS TOUCH: running stm_wire_mode_and_reset...\n");
++        stm_wire_mode_and_reset();
++        (void)stm_spi_read(hw_id_cmd, sizeof(hw_id_cmd), hw_id, sizeof(hw_id));
++        printf("SWEET EXYNOS TOUCH: post-reset hw_id: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++            hw_id[0], hw_id[1], hw_id[2], hw_id[3],
++            hw_id[4], hw_id[5], hw_id[6], hw_id[7]);
++    }
 +
 +    uint8_t dev_id_cmd = STM_TS_READ_DEVICE_ID;
 +    uint8_t dev_id[5] = { 0 };
-+    int id_err = stm_spi_read(&dev_id_cmd, 1, dev_id, sizeof(dev_id));
-+    printf("SWEET EXYNOS TOUCH: dev_id err=%d: %02x %02x %02x %02x %02x\n",
-+        id_err, dev_id[0], dev_id[1], dev_id[2], dev_id[3], dev_id[4]);
++    (void)stm_spi_read(&dev_id_cmd, 1, dev_id, sizeof(dev_id));
++    printf("SWEET EXYNOS TOUCH: dev_id: %02x %02x %02x %02x %02x\n",
++        dev_id[0], dev_id[1], dev_id[2], dev_id[3], dev_id[4]);
 +
 +    uint8_t panel_cmd = STM_TS_READ_PANEL_INFO;
 +    uint8_t panel_info[11] = { 0 };
@@ -1112,7 +1099,7 @@
 +    (void)stm_spi_write(scan_cmd, sizeof(scan_cmd), NULL, 0);
 +    touch_msleep(20);
 +
-+    printf("SWEET EXYNOS TOUCH: polling active (max_coords=%dx%d)\n",
++    printf("SWEET EXYNOS TOUCH: bitbang SPI polling active (max_coords=%dx%d)\n",
 +        max_x_coord, max_y_coord);
 +
 +    uint8_t one_event[STM_TS_EVENT_BUFF_SIZE];
@@ -1148,15 +1135,13 @@
 +    kern_return_t kr;
 +    thread_t thread;
 +
-+    printf("SWEET EXYNOS TOUCH: Mapping USI2, GPIO, and SPI2 registers...\n");
++    printf("SWEET EXYNOS TOUCH: Mapping GPIO registers for bit-banged SPI2...\n");
 +
-+    usi2_base = ml_io_map(USI2_SYSREG_PHYS, MAP_SIZE_4K);
 +    peric2_gpio_base = ml_io_map(PINCTRL_PERIC2_PHYS, MAP_SIZE_4K);
 +    alive_gpio_base = ml_io_map(PINCTRL_ALIVE_PHYS, MAP_SIZE_4K);
-+    spi2_base = ml_io_map(SPI2_BASE_PHYS, MAP_SIZE_4K);
 +
-+    if (!usi2_base || !peric2_gpio_base || !alive_gpio_base || !spi2_base) {
-+        printf("SWEET EXYNOS TOUCH: Failed to map MMIO spaces!\n");
++    if (!peric2_gpio_base || !alive_gpio_base) {
++        printf("SWEET EXYNOS TOUCH: Failed to map GPIO MMIO spaces!\n");
 +        return;
 +    }
 +
@@ -1168,6 +1153,7 @@
 +        printf("SWEET EXYNOS TOUCH: Failed to spawn thread (%d)\n", kr);
 +    }
 +}
+
 
 
 --- a/bsd/dev/sweet_ufs.c
