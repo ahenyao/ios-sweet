@@ -531,3 +531,17 @@
 +    exynos_usb_gadget_start(dwc);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+
+
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,7 +110,7 @@
+ bsd/dev/exynos_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+-bsd/dev/sweet_usb.c			standard
++bsd/dev/exynos_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
