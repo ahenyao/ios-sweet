@@ -22,7 +22,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_usb.c
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,521 @@
 +/*
 + * Exynos 2200: USB CDC-NCM / Ethernet tethering bring-up.
 + * Synopsys DWC3 controller at 0x10B00000.
@@ -525,11 +525,11 @@
 +    }
 +}
 +
-+void exynos_usb_probe(void)
++void exynos_usb_probe(void) /* or sweet_usb_probe(void) */
 +{
 +    int enabled = 1;
 +    PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
-+    if (enabled < 2) return; /* Must be at least 2 to start */
++    if (enabled < 2) return;
 +
 +    vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
 +    if (!dwc) {
@@ -538,13 +538,8 @@
 +    }
 +
 +    uint32_t snpsid = usb_rd(dwc, 0xc120);
-+    printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x\n", 
-+           snpsid, usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118));
-+
-+    if ((snpsid & 0xffff0000) != 0x55330000) {
-+        printf("SWEET USB: Invalid DWC3 ID, clocks might be off\n");
-+        return;
-+    }
++    printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x PHYCFG 0x%08x\n",
++           snpsid, usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
 +
 +    exynos_usb_gadget_start(dwc);
 +}
