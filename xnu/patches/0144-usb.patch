@@ -22,7 +22,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_usb.c
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,514 @@
 +/*
 + * Exynos 2200: USB CDC-NCM / Ethernet tethering bring-up.
 + * Synopsys DWC3 controller at 0x10B00000.
@@ -479,41 +479,13 @@
 +    ud.dma_pa = ptoa_64(pn);
 +    ud_if_create();
 +
-+    /* Map Exynos USB block controller and eUSB PHY safely via XNU I/O mapping */
-+    vm_offset_t usbcon = ml_io_map(EXYNOS_USBCON_PA, 0x1000);
-+    vm_offset_t eusb   = ml_io_map(EXYNOS_EUSB_PA, 0x1000);
-+
-+    if (usbcon && eusb) {
-+        uint32_t reg;
-+        
-+        /* 1. Take eUSB2 PHY out of reset */
-+        reg = *(volatile uint32_t *)(eusb + 0x0000);
-+        reg &= ~(1u << 0); 
-+        reg |= (1u << 1);  
-+        *(volatile uint32_t *)(eusb + 0x0000) = reg;
-+
-+        /* 2. Enable eUSB2 common block */
-+        reg = *(volatile uint32_t *)(eusb + 0x0004);
-+        reg |= (1u << 0);  
-+        *(volatile uint32_t *)(eusb + 0x0004) = reg;
-+
-+        /* 3. Force B-Valid and VBUS-Valid */
-+        reg = *(volatile uint32_t *)(usbcon + 0x0010);
-+        reg |= (1u << 0) | (1u << 1); 
-+        *(volatile uint32_t *)(usbcon + 0x0010) = reg;
-+
-+        /* 4. Bypass bus filters and enable Q-action */
-+        reg = *(volatile uint32_t *)(usbcon + 0x0004);
-+        reg |= (1u << 8) | (0xfu << 4); 
-+        *(volatile uint32_t *)(usbcon + 0x0004) = reg;
-+        
-+        __asm__ volatile ("dsb sy" ::: "memory");
-+        printf("SWEET USB: Exynos block & eUSB PHY initialized via XNU mapping\n");
-+    } else {
-+        printf("SWEET USB: Failed to map Exynos USB block registers\n");
++    /* Safe Soft Reset */
++    dwc_wr(ud.dwc, DCTL, DCTL_CSFTRST);
++    int i; for (i = 0; i < 50 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
++    if (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) {
++        dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) & ~DCTL_CSFTRST);
 +    }
 +
-+    /* Continue with DWC3 setup... */
 +    dwc_wr(ud.dwc, GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 +    dwc_wr(ud.dwc, GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
 +    dwc_wr(ud.dwc, GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
@@ -535,7 +507,6 @@
 +    ud_start_setup();
 +
 +    dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) | DCTL_RUN_STOP);
-+    int i;
 +    for (i = 0; i < 500 && (usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); i++) delay(1000);
 +    printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", usb_rd(ud.dwc, DSTS), i, ud.dma_pa);
 +    
