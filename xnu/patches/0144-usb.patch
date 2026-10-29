@@ -22,7 +22,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_usb.c
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,536 @@
 +/*
 + * Exynos 2200: USB CDC-NCM / Ethernet tethering bring-up.
 + * Synopsys DWC3 controller at 0x10B00000.
@@ -459,6 +459,13 @@
 +    }
 +}
 +
++#define DWC3_GUSB2PHYCFG(n) (0xc200 + (n * 4))
++#define DWC3_GUSB3PIPECTL(n) (0xc2c0 + (n * 4))
++#define DWC3_GUSB2PHYCFG_ENBLSLPM (1 << 8)
++#define DWC3_GUSB2PHYCFG_U2_FREECLK_EXISTS (1 << 30)
++#define DWC3_GUSB2PHYCFG_SUSPHY (1 << 6)
++#define DWC3_GUSB3PIPECTL_SUSPHY (1 << 17)
++
 +static void exynos_usb_gadget_start(vm_offset_t dwc) {
 +    thread_t thread; ud.dwc = dwc;
 +    if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
@@ -469,7 +476,20 @@
 +    ud.dma_pa = ptoa_64(pn);
 +    ud_if_create();
 +
-+    /* Try soft reset, but don't abort if DWC_usb31 keeps it asserted */
++    /* 1. EXYNOS GLUE PHY SETUP */
++    uint32_t reg;
++    /* Wake up USB 3.0 PHY and clear suspend */
++    reg = usb_rd(ud.dwc, DWC3_GUSB3PIPECTL(0));
++    reg &= ~DWC3_GUSB3PIPECTL_SUSPHY;
++    dwc_wr(ud.dwc, DWC3_GUSB3PIPECTL(0), reg);
++
++    /* Wake up USB 2.0 PHY, disable sleep mode, and assert free clock */
++    reg = usb_rd(ud.dwc, DWC3_GUSB2PHYCFG(0));
++    reg &= ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM);
++    reg |= DWC3_GUSB2PHYCFG_U2_FREECLK_EXISTS;
++    dwc_wr(ud.dwc, DWC3_GUSB2PHYCFG(0), reg);
++
++    /* 2. SOFT RESET (Bypass if stuck on DWC_usb31) */
 +    dwc_wr(ud.dwc, DCTL, DCTL_CSFTRST);
 +    int i; for (i = 0; i < 50 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
 +    if (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) {
@@ -480,6 +500,7 @@
 +        printf("SWEET USB: soft reset done after %d ms\n", i);
 +    }
 +
++    /* 3. CORE INIT */
 +    dwc_wr(ud.dwc, GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 +    dwc_wr(ud.dwc, GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
 +    dwc_wr(ud.dwc, GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
@@ -500,6 +521,13 @@
 +    dwc_wr(ud.dwc, DALEPENA, 0x3);
 +    ud_start_setup();
 +
++    /* Set device mode explicitly in GCTL */
++    reg = usb_rd(ud.dwc, GCTL);
++    reg &= ~(3 << 12); /* Clear PRTCAPDIR */
++    reg |= (2 << 12);  /* Set PRTCAPDIR to Device */
++    dwc_wr(ud.dwc, GCTL, reg);
++
++    /* 4. RUN GADGET */
 +    dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) | DCTL_RUN_STOP);
 +    for (i = 0; i < 500 && (usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); i++) delay(1000);
 +    printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", usb_rd(ud.dwc, DSTS), i, ud.dma_pa);
