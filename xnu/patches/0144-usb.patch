@@ -22,7 +22,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_usb.c
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,508 @@
 +/*
 + * Exynos 2200: USB CDC-NCM / Ethernet tethering bring-up.
 + * Synopsys DWC3 controller at 0x10B00000.
@@ -469,29 +469,16 @@
 +    ud.dma_pa = ptoa_64(pn);
 +    ud_if_create();
 +
-+    /* Save bootloader GCTL and GUSB2PHYCFG in case CSFTRST clears them */
-+    uint32_t saved_gctl = usb_rd(ud.dwc, GCTL);
-+    uint32_t saved_phycfg = usb_rd(ud.dwc, 0xc200);
-+
-+    /* Ensure controller is halted before issuing CSFTRST */
-+    if (!(usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT)) {
-+        dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) & ~DCTL_RUN_STOP);
-+        for (int w = 0; w < 100 && !(usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); w++) {
-+            delay(1000);
-+        }
-+    }
-+
-+    /* Soft reset DWC3 device block */
++    /* Try soft reset, but don't abort if DWC_usb31 keeps it asserted */
 +    dwc_wr(ud.dwc, DCTL, DCTL_CSFTRST);
-+    int i; for (i = 0; i < 500 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
-+    printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x DSTS 0x%08x\n",
-+        (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i,
-+        usb_rd(ud.dwc, GCTL), usb_rd(ud.dwc, DCFG), usb_rd(ud.dwc, DSTS));
-+    if (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) return;
-+
-+    /* Restore GCTL and GUSB2PHYCFG (disable suspend/sleep during enumeration) */
-+    dwc_wr(ud.dwc, GCTL, saved_gctl);
-+    dwc_wr(ud.dwc, 0xc200, saved_phycfg & ~((1u << 6) | (1u << 8)));
++    int i; for (i = 0; i < 50 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
++    if (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) {
++        printf("SWEET USB: soft reset bit held by DWC_usb31 core; clearing and proceeding\n");
++        dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) & ~DCTL_CSFTRST);
++        delay(10);
++    } else {
++        printf("SWEET USB: soft reset done after %d ms\n", i);
++    }
 +
 +    dwc_wr(ud.dwc, GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 +    dwc_wr(ud.dwc, GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
@@ -499,7 +486,6 @@
 +    dwc_wr(ud.dwc, GEVNTCOUNT, usb_rd(ud.dwc, GEVNTCOUNT) & 0xffff);
 +    ud.evt_pos = 0;
 +
-+    /* High speed (0), address 0 */
 +    uint32_t dcfg = usb_rd(ud.dwc, DCFG) & ~(7u | (0x7fu << 3));
 +    dwc_wr(ud.dwc, DCFG, dcfg | 0);
 +    dwc_wr(ud.dwc, DEVTEN, 0x7);
@@ -517,8 +503,9 @@
 +    dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) | DCTL_RUN_STOP);
 +    for (i = 0; i < 500 && (usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); i++) delay(1000);
 +    printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", usb_rd(ud.dwc, DSTS), i, ud.dma_pa);
++    
 +    if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
-+
++    
 +    int livelog = 1; PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
 +    if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
 +        thread_deallocate(thread);
