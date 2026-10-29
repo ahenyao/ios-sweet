@@ -22,7 +22,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_usb.c
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,526 @@
 +/*
 + * Exynos 2200: USB CDC-NCM / Ethernet tethering bring-up.
 + * Synopsys DWC3 controller at 0x10B00000.
@@ -469,12 +469,29 @@
 +    ud.dma_pa = ptoa_64(pn);
 +    ud_if_create();
 +
-+    /* Soft reset DWC3 */
++    /* Save bootloader GCTL and GUSB2PHYCFG in case CSFTRST clears them */
++    uint32_t saved_gctl = usb_rd(ud.dwc, GCTL);
++    uint32_t saved_phycfg = usb_rd(ud.dwc, 0xc200);
++
++    /* Ensure controller is halted before issuing CSFTRST */
++    if (!(usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT)) {
++        dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) & ~DCTL_RUN_STOP);
++        for (int w = 0; w < 100 && !(usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); w++) {
++            delay(1000);
++        }
++    }
++
++    /* Soft reset DWC3 device block */
 +    dwc_wr(ud.dwc, DCTL, DCTL_CSFTRST);
 +    int i; for (i = 0; i < 500 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
-+    printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
-+        (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, usb_rd(ud.dwc, GCTL), usb_rd(ud.dwc, DCFG));
++    printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x DSTS 0x%08x\n",
++        (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i,
++        usb_rd(ud.dwc, GCTL), usb_rd(ud.dwc, DCFG), usb_rd(ud.dwc, DSTS));
 +    if (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) return;
++
++    /* Restore GCTL and GUSB2PHYCFG (disable suspend/sleep during enumeration) */
++    dwc_wr(ud.dwc, GCTL, saved_gctl);
++    dwc_wr(ud.dwc, 0xc200, saved_phycfg & ~((1u << 6) | (1u << 8)));
 +
 +    dwc_wr(ud.dwc, GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 +    dwc_wr(ud.dwc, GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
@@ -482,6 +499,7 @@
 +    dwc_wr(ud.dwc, GEVNTCOUNT, usb_rd(ud.dwc, GEVNTCOUNT) & 0xffff);
 +    ud.evt_pos = 0;
 +
++    /* High speed (0), address 0 */
 +    uint32_t dcfg = usb_rd(ud.dwc, DCFG) & ~(7u | (0x7fu << 3));
 +    dwc_wr(ud.dwc, DCFG, dcfg | 0);
 +    dwc_wr(ud.dwc, DEVTEN, 0x7);
@@ -500,7 +518,7 @@
 +    for (i = 0; i < 500 && (usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); i++) delay(1000);
 +    printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", usb_rd(ud.dwc, DSTS), i, ud.dma_pa);
 +    if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
-+    
++
 +    int livelog = 1; PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
 +    if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
 +        thread_deallocate(thread);
@@ -545,3 +563,97 @@
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
+
+
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -73,65 +73,31 @@
+ 	return v;
+ }
+ 
+-void
+-sweet_usb_probe(void)
++void sweet_usb_probe(void)
+ {
+-	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+-	bool clocks_on = true;
+-
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+-	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+-	if (!enabled) {
+-		return;
+-	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+-	if (gcc == 0) {
+-		printf("SWEET USB: GCC map failed\n");
+-		return;
+-	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+-	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+-		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+-	}
+-	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+-	if (!clocks_on) {
+-		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+-		return;
+-	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+-	if (dwc == 0) {
+-		printf("SWEET USB: DWC3 map failed\n");
+-		return;
+-	}
+-	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+-	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+-	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+-	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+-	    usb_rd(dwc, 0xc720));
+-	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+-	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
+-	if (enabled >= 2) {
+-		sweet_usb_gadget_start(dwc);
+-	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++    int enabled = 1;
++    PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++    if (enabled < 2) return;
++
++    vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++    if (!dwc) {
++        printf("SWEET USB: DWC3 map failed\n");
++        return;
++    }
++
++    uint32_t snpsid = usb_rd(dwc, 0xc120);
++    printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x PHYCFG 0x%08x\n",
++           snpsid, usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
++    printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x GHWPARAMS0 0x%08x\n",
++           usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc70c), usb_rd(dwc, 0xc140));
++
++    /* Accept both DWC_usb3 (0x5533xxxx) and DWC_usb31 (0x3331xxxx / "3110") */
++    if ((snpsid & 0xffff0000) != 0x55330000 && (snpsid & 0xffff0000) != 0x33310000) {
++        printf("SWEET USB: Invalid DWC3 ID, clocks might be off\n");
++        return;
++    }
++
++    exynos_usb_gadget_start(dwc);
+ }
+ 
+ /*
