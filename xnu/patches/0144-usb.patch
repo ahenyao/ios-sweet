@@ -22,7 +22,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/exynos_usb.c
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,762 @@
 +/*
 + * Exynos 2200: USB CDC-NCM / Ethernet tethering bring-up.
 + * Synopsys DWC3 controller at 0x10B00000.
@@ -469,6 +469,222 @@
 +#define EXYNOS_USBCON_PA      0x10AA0000u
 +#define EXYNOS_EUSB_PA        0x10AB0000u
 +
++#define EXYNOS_GPIO_ALIVE_PA    0x15850000ULL
++#define EXYNOS_PMU_ALIVE_PA     0x15860000ULL
++#define EXYNOS_CMU_HSI0_PA      0x10A00000ULL
++#define EXYNOS_USBCON_PA        0x10AA0000ULL
++#define EXYNOS_EUSB_CON_PA      0x10AB0000ULL
++
++static inline uint32_t mmio_rd(vm_offset_t base, uint32_t off) {
++    return *(volatile uint32_t *)(base + off);
++}
++
++static inline void mmio_wr(vm_offset_t base, uint32_t off, uint32_t val) {
++    *(volatile uint32_t *)(base + off) = val;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void exynos_usb_phy_and_clk_init(void) {
++    uint32_t reg;
++
++    /* 1. Drive GPA4-1 (eusb_ctrl_sel) high in ALIVE GPIO (0x15850000) */
++    vm_offset_t gpio_alive = ml_io_map(EXYNOS_GPIO_ALIVE_PA, 0x1000);
++    if (gpio_alive) {
++        /* GPA4 is at offset 0x80: CON=0x80, DAT=0x84, PUD=0x88 */
++        reg = mmio_rd(gpio_alive, 0x0080);
++        reg = (reg & ~(0xfu << 4)) | (0x1u << 4); /* Output mode for pin 1 */
++        mmio_wr(gpio_alive, 0x0080, reg);
++        reg = mmio_rd(gpio_alive, 0x0084);
++        mmio_wr(gpio_alive, 0x0084, reg | (1u << 1)); /* Set pin 1 HIGH */
++    }
++
++    /* 2. Ensure PD_HSI0 is on and release PMU PHY isolation (0x15860000) */
++    vm_offset_t pmu = ml_io_map(EXYNOS_PMU_ALIVE_PA, 0x4000);
++    if (pmu) {
++        if ((mmio_rd(pmu, 0x2504) & 1u) == 0) {
++            mmio_wr(pmu, 0x2500, 1u);
++            for (int i = 0; i < 1000 && !(mmio_rd(pmu, 0x2504) & 1u); i++)
++                delay(10);
++        }
++        /* pmu_offset = 0x72c (UTMI), pmu_offset_dp = 0x730 (PIPE3): bit 0 = 1 (un-isolate) */
++        mmio_wr(pmu, 0x072c, mmio_rd(pmu, 0x072c) | 1u);
++        mmio_wr(pmu, 0x0730, mmio_rd(pmu, 0x0730) | 1u);
++        delay(100);
++    }
++
++    /* 3. Ungate all USB/eUSB clocks & Q-channels in CMU_HSI0 (0x10A00000) */
++    vm_offset_t cmu_hsi0 = ml_io_map(EXYNOS_CMU_HSI0_PA, 0x4000);
++    if (cmu_hsi0) {
++        /* Ensure NOC_USER and USB32DRD_USER PLL MUXes select active clock (bit 4) */
++        mmio_wr(cmu_hsi0, 0x0630, mmio_rd(cmu_hsi0, 0x0630) | (1u << 4));
++        mmio_wr(cmu_hsi0, 0x0634, mmio_rd(cmu_hsi0, 0x0634) & ~(1u << 28));
++        mmio_wr(cmu_hsi0, 0x0640, mmio_rd(cmu_hsi0, 0x0640) | (1u << 4));
++        mmio_wr(cmu_hsi0, 0x0644, mmio_rd(cmu_hsi0, 0x0644) & ~(1u << 28));
++
++        /* Disable automatic clock gating in CMU_HSI0 controller option */
++        reg = mmio_rd(cmu_hsi0, 0x0800);
++        reg &= ~((1u << 28) | (1u << 29));
++        mmio_wr(cmu_hsi0, 0x0800, reg);
++
++        /* Set DIV_CLK_HSI0_EUSB (divratio=1, disable auto clock gating) */
++        reg = mmio_rd(cmu_hsi0, 0x1800);
++        reg = (reg & ~(0x3u | (1u << 28))) | 1u;
++        mmio_wr(cmu_hsi0, 0x1800, reg);
++
++        /* Force-enable all USB32DRD Q-channels (ENABLE | CLOCK_REQ | IGNORE_FORCE_PM_EN) */
++        static const uint32_t qch_offs[] = {
++            0x3058, /* S_CTRL */
++            0x305c, /* S_EUSBCTL */
++            0x3060, /* S_EUSBPHY */
++            0x3064, /* S_LINK */
++            0x3068, /* S_SUBCTRL */
++            0x306c  /* S_TCA */
++        };
++        for (unsigned i = 0; i < sizeof(qch_offs) / sizeof(qch_offs[0]); i++) {
++            mmio_wr(cmu_hsi0, qch_offs[i], mmio_rd(cmu_hsi0, qch_offs[i]) | 0x7u);
++        }
++
++        /* Force-ungate all USB32DRD and EUSB clock gates (MANUAL=bit 20, CG_VAL=bit 21, auto=bit 28 off) */
++        static const uint32_t gat_offs[] = {
++            0x2000, /* AS_APB_EUSBPHY_HSI0_IPCLKPORT_PCLKM */
++            0x2020, /* RSTNSYNC_CLK_HSI0_EUSB_IPCLKPORT_CLK */
++            0x204c, /* USB32DRD_IPCLKPORT_I_EUSB_APB_CLK */
++            0x2050, /* USB32DRD_IPCLKPORT_I_EUSB_CTRL_PCLK */
++            0x2054, /* USB32DRD_IPCLKPORT_I_USB32DRD_REF_CLK_40 */
++            0x2058, /* USB32DRD_IPCLKPORT_I_USBDPPHY_CTRL_PCLK */
++            0x205c, /* USB32DRD_IPCLKPORT_I_USBDPPHY_TCA_APB_CLK */
++            0x2060, /* USB32DRD_IPCLKPORT_I_USBLINK_ACLK */
++            0x2064  /* USB32DRD_IPCLKPORT_I_USBSUBCTL_APB_PCLK */
++        };
++        for (unsigned i = 0; i < sizeof(gat_offs) / sizeof(gat_offs[0]); i++) {
++            reg = mmio_rd(cmu_hsi0, gat_offs[i]);
++            reg &= ~(1u << 28);
++            reg |= (1u << 21) | (1u << 20);
++            mmio_wr(cmu_hsi0, gat_offs[i], reg);
++        }
++        delay(200);
++        printf("SWEET USB: CMU_HSI0 clocks ungated (EUSB_PCLK=0x%08x SUBCTL_PCLK=0x%08x)\n",
++               mmio_rd(cmu_hsi0, 0x2050), mmio_rd(cmu_hsi0, 0x2064));
++    }
++
++    /* 4. Initialize Exynos USB Block Controller (0x10AA0000 - exynos_usbcon_init_link) */
++    vm_offset_t usbcon = ml_io_map(EXYNOS_USBCON_PA, 0x1000);
++    if (usbcon) {
++        printf("SWEET USB: USBCON VER=0x%08x LINKCTRL=0x%08x\n",
++               mmio_rd(usbcon, 0x0000), mmio_rd(usbcon, 0x0004));
++
++        /* LINKCTRL: disable Q-channel gating and bypass debounce filters */
++        reg = mmio_rd(usbcon, 0x0004);
++        reg |= (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12); /* dis_*_qact */
++        reg &= ~(1u << 8); /* force_qact = 0 */
++        delay(500);
++        mmio_wr(usbcon, 0x0004, reg);
++        delay(500);
++        reg |= (1u << 8) | (0xfu << 4); /* force_qact = 1, bus_filter_bypass = 0xf */
++        reg &= ~(3u << 20); /* sel_sof = 0 */
++        mmio_wr(usbcon, 0x0004, reg);
++
++        /* Pulse link_sw_rst in LINK_CLKRST (0x0C) */
++        reg = mmio_rd(usbcon, 0x000c);
++        mmio_wr(usbcon, 0x000c, reg | (1u << 0));
++        delay(20);
++        mmio_wr(usbcon, 0x000c, reg & ~(1u << 0));
++        delay(20);
++
++        /* UTMI_CTRL (0x10): force_bvalid = 1, force_vbusvalid = 1 */
++        reg = mmio_rd(usbcon, 0x0010);
++        reg |= (1u << 0) | (1u << 1);
++        mmio_wr(usbcon, 0x0010, reg);
++
++        /* Disable ReWA & mask ReWA interrupts (ready_rewa) */
++        mmio_wr(usbcon, 0x0050, mmio_rd(usbcon, 0x0050) & ~1u);
++        reg = mmio_rd(usbcon, 0x0058);
++        reg = (reg | (1u << 24)) & ~(1u << 28);
++        mmio_wr(usbcon, 0x0058, reg);
++        mmio_wr(usbcon, 0x005c, 0xff00u);
++        mmio_wr(usbcon, 0x0060, 0x1u);
++        mmio_wr(usbcon, 0x0054, mmio_rd(usbcon, 0x0054) | 0x1111u);
++        mmio_wr(usbcon, 0x006c, mmio_rd(usbcon, 0x006c) | 0x70007u);
++
++        /* Detach PIPE3 PHY so High-Speed (eUSB2) operates standalone */
++        reg = mmio_rd(usbcon, 0x0004);
++        reg |= (1u << 16) | (1u << 18); /* force_pipe_en = 1, force_rxelecidle = 1 */
++        reg &= ~(1u << 17);             /* force_phystatus = 0 */
++        mmio_wr(usbcon, 0x0004, reg);
++
++        reg = mmio_rd(usbcon, 0x000c);
++        mmio_wr(usbcon, 0x000c, reg & ~(1u << 1)); /* link_pclk_sel = 0 */
++
++        reg = mmio_rd(usbcon, 0x0114); /* HSP_MISC: calibrate eUSB PHY only */
++        reg = (reg & ~0xf3u) | 0x12u;  /* sel_res_tune_mux = 2, set_req_in2 = 1 */
++        mmio_wr(usbcon, 0x0114, reg);
++    }
++
++    /* 5. Initialize eUSB 2.0 PHY (0x10AB0000 - phy_exynos_eusb_initiate) */
++    vm_offset_t eusb = ml_io_map(EXYNOS_EUSB_CON_PA, 0x1000);
++    if (eusb) {
++        /* Step 1: Hold phy_reset and utmi_port_reset at 1 */
++        reg = mmio_rd(eusb, 0x0000);
++        reg |= (1u << 0) | (1u << 1) | (1u << 4) | (1u << 5);
++        mmio_wr(eusb, 0x0000, reg);
++
++        /* Step 2: Repeater mode = 1, Ref freq = 26MHz (ref_freq_sel = 3, pll_fb_div = 263) */
++        reg = mmio_rd(eusb, 0x0004);
++        reg |= (1u << 10); /* phy_cfg_rptr_mode = 1 */
++        reg = (reg & ~(7u << 4)) | (3u << 4); /* ref_freq_sel = 3 (26MHz) */
++        mmio_wr(eusb, 0x0004, reg);
++
++        reg = mmio_rd(eusb, 0x0008);
++        reg = (reg & ~(0xfffu << 8)) | (263u << 8); /* pll_fb_div = 263 */
++        mmio_wr(eusb, 0x0008, reg);
++
++        reg = mmio_rd(eusb, 0x000c);
++        reg &= ~(0xfu << 8); /* pll_ref_div = 0 */
++        mmio_wr(eusb, 0x000c, reg);
++
++        /* Apply g0s DT hs_tune_phy: tx_fsls_vref_tune = 0 */
++        reg = mmio_rd(eusb, 0x0014);
++        reg &= ~(3u << 1);
++        mmio_wr(eusb, 0x0014, reg);
++
++        /* Force UTMI vbus_valid_ext = 1 and clk_force_en = 1 in EUSBCON_REG_UTMI (0x1C) */
++        reg = mmio_rd(eusb, 0x001c);
++        reg |= (1u << 0) | (1u << 11) | (1u << 12);
++        mmio_wr(eusb, 0x001c, reg);
++
++        /* Step 3: Release test_iddq = 0, keep phy_enable = 0 */
++        reg = mmio_rd(eusb, 0x0020);
++        reg &= ~(1u << 6); /* test_iddq = 0 */
++        mmio_wr(eusb, 0x0020, reg);
++
++        reg = mmio_rd(eusb, 0x0004);
++        reg &= ~(1u << 0); /* phy_enable = 0 */
++        mmio_wr(eusb, 0x0004, reg);
++        delay(20);
++
++        /* Step 6: Release phy_reset from 1 to 0 */
++        reg = mmio_rd(eusb, 0x0000);
++        reg &= ~(1u << 0);
++        mmio_wr(eusb, 0x0000, reg);
++        delay(20);
++
++        /* Step 7: Assert phy_enable = 1 and wait 3.6ms for REXT cal & utmi_clk + ESE1 reset */
++        reg = mmio_rd(eusb, 0x0004);
++        reg |= (1u << 0);
++        mmio_wr(eusb, 0x0004, reg);
++        delay(3600);
++
++        /* Release utmi_port_reset and override */
++        reg = mmio_rd(eusb, 0x0000);
++        reg &= ~((1u << 4) | (1u << 5));
++        mmio_wr(eusb, 0x0000, reg);
++        delay(100);
++
++        printf("SWEET USB: eUSB PHY initialized (RST=0x%08x CMN=0x%08x UTMI=0x%08x)\n",
++               mmio_rd(eusb, 0x0000), mmio_rd(eusb, 0x0004), mmio_rd(eusb, 0x001c));
++    }
++}
++
 +static void exynos_usb_gadget_start(vm_offset_t dwc) {
 +    thread_t thread; ud.dwc = dwc;
 +    if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
@@ -479,21 +695,47 @@
 +    ud.dma_pa = ptoa_64(pn);
 +    ud_if_create();
 +
-+    /* Safe Soft Reset */
++    /* 1. Power up & ungate Exynos HSI0 clocks, USBCON link, and eUSB 2.0 PHY */
++    exynos_usb_phy_and_clk_init();
++
++    /* 2. Configure DWC3 PHY interface registers (clear SUSPHY & U2_FREECLK_EXISTS) */
++    uint32_t phycfg = usb_rd(ud.dwc, 0xc200);
++    phycfg &= ~((1u << 6) | (1u << 30)); /* Clear SUSPHY and U2_FREECLK_EXISTS */
++    phycfg |= (1u << 8);                 /* ENBLSLPM */
++    dwc_wr(ud.dwc, 0xc200, phycfg);
++
++    uint32_t pipectl = usb_rd(ud.dwc, 0xc2c0);
++    pipectl &= ~(1u << 17);              /* Clear SUSPHY */
++    dwc_wr(ud.dwc, 0xc2c0, pipectl);
++
++    /* 3. Soft Reset DWC3 Device Controller (now clocked by utmi_clk) */
 +    dwc_wr(ud.dwc, DCTL, DCTL_CSFTRST);
-+    int i; for (i = 0; i < 50 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
++    int i;
++    for (i = 0; i < 100 && (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST); i++) delay(1000);
 +    if (usb_rd(ud.dwc, DCTL) & DCTL_CSFTRST) {
++        printf("SWEET USB: CSFTRST still set after %d ms, clearing manually\n", i);
 +        dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) & ~DCTL_CSFTRST);
++        delay(1000);
++    } else {
++        printf("SWEET USB: soft reset completed cleanly in %d ms!\n", i);
 +    }
 +
++    /* 4. Exynos DWC3 Core & GCTL Device Mode setup */
++    uint32_t gctl = usb_rd(ud.dwc, GCTL);
++    gctl &= ~((3u << 12) | (1u << 10)); /* Clear PRTCAPDIR and SOFITPSYNC */
++    gctl |= (2u << 12);                 /* Set PRTCAPDIR = Device (2) */
++    dwc_wr(ud.dwc, GCTL, gctl);
++
++    /* 5. Event buffer & High-Speed DCFG setup */
 +    dwc_wr(ud.dwc, GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
 +    dwc_wr(ud.dwc, GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
 +    dwc_wr(ud.dwc, GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
 +    dwc_wr(ud.dwc, GEVNTCOUNT, usb_rd(ud.dwc, GEVNTCOUNT) & 0xffff);
 +    ud.evt_pos = 0;
 +
++    /* Force High-Speed (0) in DCFG bits [2:0] and Device Address 0 */
 +    uint32_t dcfg = usb_rd(ud.dwc, DCFG) & ~(7u | (0x7fu << 3));
-+    dwc_wr(ud.dwc, DCFG, dcfg | 0);
++    dwc_wr(ud.dwc, DCFG, dcfg | 0u);
 +    dwc_wr(ud.dwc, DEVTEN, 0x7);
 +
 +    if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
@@ -506,12 +748,18 @@
 +    dwc_wr(ud.dwc, DALEPENA, 0x3);
 +    ud_start_setup();
 +
-+    dwc_wr(ud.dwc, DCTL, usb_rd(ud.dwc, DCTL) | DCTL_RUN_STOP);
++    /* 6. Assert DCTL_RUN_STOP to connect D+ pullup */
++    uint32_t dctl = usb_rd(ud.dwc, DCTL);
++    dctl &= ~(1u << 31); /* ClearCSFTRST / KEEP_CONNECT if any */
++    dctl |= DCTL_RUN_STOP;
++    dwc_wr(ud.dwc, DCTL, dctl);
++
 +    for (i = 0; i < 500 && (usb_rd(ud.dwc, DSTS) & DSTS_DEVCTRLHLT); i++) delay(1000);
-+    printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", usb_rd(ud.dwc, DSTS), i, ud.dma_pa);
-+    
++    printf("SWEET USB: running (DSTS 0x%08x DCTL 0x%08x after %d ms), DMA at 0x%llx\n",
++           usb_rd(ud.dwc, DSTS), usb_rd(ud.dwc, DCTL), i, ud.dma_pa);
++
 +    if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
-+    
++
 +    int livelog = 1; PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
 +    if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
 +        thread_deallocate(thread);
