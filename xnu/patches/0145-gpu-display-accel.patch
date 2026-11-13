@@ -49,7 +49,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,14 +43,6 @@
+@@ -70,23 +43,423 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -64,27 +64,46 @@
  #define SWEET_FB_LOGICAL_W              1125
  #define SWEET_FB_LOGICAL_H              2436
  #define SWEET_FB_FORMAT_BGRA            0x42475241
-@@ -87,6 +52,176 @@
++#define SWEET_FB_FORMAT_W30R            0x77333072
++#define SWEET_FB_FORMAT_B3A8            0x62336138
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
  };
  
  OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
 +
 +/*
-+ * Exynos 2200 (s5e9925 / g0s) Display DMA (DPP0 / DECON0) & G3D probe.
-+ * Confirmed on hardware:
-+ *   DPP0_DMA (0x1ad00000) + 0x040 = IDMA_BASE_ADDR_Y8_0 (0xf6200000)
-+ *   DPP0_DMA (0x1ad00000) + 0x440 = IDMA_BASE_ADDR_Y8_0_S (shadow, 0xf6200000)
-+ *
-+ * NOTE: Do NOT kick pd_g3dcore (0x15862280) or read SGPU MMIO (0x16cd0000 /
-+ * 0x16e00000) until CMU_G3D clocks and TZMP SMC (0x16c10204) are initialized,
-+ * otherwise reading unclocked SGPU registers triggers an AXI SError panic!
++ * Exynos 2200 (s5e9925 / g0s) Display DMA (DPP0 / DECON0) & Xclipse 920 (sgpu)
++ * Power Domain (pd_g3dcore) + TrustZone DTZPC SMC + BG3D_PWRCTL bring-up.
 + */
-+#define EXYNOS_PMU_BASE_PA      0x15860000ULL
-+#define EXYNOS_DPP0_DMA_PA      0x1ad00000ULL
-+#define EXYNOS_DECON0_MAIN_PA   0x19f00000ULL
++#define EXYNOS_PMU_BASE_PA              0x15860000ULL
++#define EXYNOS_GPUSRAMHOLD_PA           0x15bb0000ULL
++#define EXYNOS_G3D_SYSREG_PA            0x16c00000ULL
++#define EXYNOS_CMU_G3D_QCH_PA           0x16c20000ULL
++#define EXYNOS_CMU_G3D_PA               0x16c30000ULL
++#define EXYNOS_G3D_DUMP_PA              0x16c60000ULL
++#define EXYNOS_G3D_STR_MUX_PA           0x16c80000ULL
++#define EXYNOS_BG3D_PWRCTL_PA           0x16cd0000ULL
++#define EXYNOS_SGPU_SMN_PA              0x16e00000ULL
++#define EXYNOS_DPP0_DMA_PA              0x1ad00000ULL
++#define EXYNOS_DECON0_MAIN_PA           0x19f00000ULL
++
++#define SMC_CMD_PREAPRE_PD_ONOFF        0x82000410ULL
++#define EXYNOS_WAKEUP_PD_DOWN           1ULL
++#define G3DCORE_NEED_SMC_ID             0x16c10204ULL
++#define RUNTIME_PM_TZPC_GROUP           2ULL
++
++#define BG3D_PWRCTL_CTL1_OFFSET         0x00
++#define BG3D_PWRCTL_CTL2_OFFSET         0x04
++#define BG3D_PWRCTL_STATUS_OFFSET       0x08
++#define BG3D_PWRCTL_LOCK_OFFSET         0x0c
++#define BG3D_PWRCTL_STATUS_GPU_READY    0x80000000U
 +
 +static vm_offset_t g_dpp0_dma_va;
 +static vm_offset_t g_decon0_va;
++static uint32_t    g_sgpu_grbm_status;
++static bool        g_sgpu_powered;
 +
 +static inline uint32_t
 +exynos_mmio_rd32(vm_offset_t base, uint32_t off)
@@ -99,6 +118,34 @@
 +{
 +	*(volatile uint32_t *)(base + off) = v;
 +	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static inline void
++exynos_mmio_rmw32(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t val)
++{
++	uint32_t cur = exynos_mmio_rd32(base, off);
++	exynos_mmio_wr32(base, off, (cur & ~mask) | (val & mask));
++}
++
++static uint64_t
++exynos_smc(uint64_t cmd, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t *out_a1)
++{
++	register uint64_t x0 __asm__("x0") = cmd;
++	register uint64_t x1 __asm__("x1") = arg1;
++	register uint64_t x2 __asm__("x2") = arg2;
++	register uint64_t x3 __asm__("x3") = arg3;
++	__asm__ volatile(
++		"dsb sy\n\t"
++		"smc #0\n\t"
++		: "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++		:
++		: "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++		  "x12", "x13", "x14", "x15", "x16", "x17", "memory"
++	);
++	if (out_a1 != NULL) {
++		*out_a1 = x1;
++	}
++	return x0;
 +}
 +
 +/*
@@ -127,10 +174,27 @@
 +	}
 +}
 +
++/*
++ * Convert a row of 10-bit RGB10A2 ('w30r' = 0x77333072) pixels to 8-bit BGRA8888.
++ */
++static inline void
++sweet_fb_copy_w30r_row(uint32_t *dst, const uint32_t *src, uint32_t count)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t p = src[i];
++		uint32_t r = (p >> 22) & 0xff;
++		uint32_t g = (p >> 12) & 0xff;
++		uint32_t b = (p >> 2)  & 0xff;
++		dst[i] = 0xff000000U | (r << 16) | (g << 8) | b;
++	}
++}
++
 +class IOAcceleratorES : public IOService {
 +	OSDeclareDefaultStructors(IOAcceleratorES);
 +public:
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 +};
 +
 +OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
@@ -138,9 +202,14 @@
 +class SweetAcceleratorUserClient : public IOUserClient {
 +	OSDeclareDefaultStructors(SweetAcceleratorUserClient);
 +	task_t fTask;
++	UInt32 fType;
++	IOBufferMemoryDescriptor *fSharedMem;
 +public:
 +	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
 +	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
 +	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
 +};
@@ -153,11 +222,33 @@
 +	if (!IOService::start(provider)) {
 +		return false;
 +	}
++	setName("IOAcceleratorES");
 +	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
 +	setProperty("IOClass", "IOAcceleratorES");
++	setProperty("IOMatchCategory", "IOAcceleratorES");
++	setProperty("MetalPluginName", "AGXMetalA11");
++	setProperty("MetalPluginClassName", "AGXPrincipalDevice");
 +	registerService();
 +	IOLog("SWEET GPU: IOAcceleratorES service registered\n");
 +	return true;
++}
++
++IOReturn
++IOAcceleratorES::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    __unused OSDictionary *properties, IOUserClient **handler)
++{
++	SweetAcceleratorUserClient *client = OSTypeAlloc(SweetAcceleratorUserClient);
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityID, type) ||
++	    !client->attach(this) ||
++	    !client->start(this)) {
++		client->release();
++		return kIOReturnError;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
 +}
 +
 +bool
@@ -167,16 +258,45 @@
 +		return false;
 +	}
 +	fTask = owningTask;
++	fType = type;
++	fSharedMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	if (fSharedMem != NULL) {
++		bzero(fSharedMem->getBytesNoCopy(), page_size);
++	}
 +	char name[32];
 +	proc_selfname(name, sizeof(name));
 +	IOLog("SWEET GPU: %s opened IOAcceleratorES user client (type %u)\n", name, (uint32_t)type);
 +	return true;
 +}
 +
++void
++SweetAcceleratorUserClient::free()
++{
++	OSSafeReleaseNULL(fSharedMem);
++	IOUserClient::free();
++}
++
 +IOReturn
 +SweetAcceleratorUserClient::clientClose(void)
 +{
 +	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAcceleratorUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET GPU: %s clientMemoryForType(%u)\n", name, (uint32_t)type);
++	if (fSharedMem == NULL) {
++		return kIOReturnNoMemory;
++	}
++	fSharedMem->retain();
++	*options = 0;
++	*memory = fSharedMem;
 +	return kIOReturnSuccess;
 +}
 +
@@ -192,11 +312,129 @@
 +		}
 +		char name[32];
 +		proc_selfname(name, sizeof(name));
-+		IOLog("SWEET GPU: %s sel %u in %u/%u out %u/%u\n", name, selector,
++		IOLog("SWEET GPU: %s type %u sel %u in %u/%u out %u/%u\n",
++		    name, (uint32_t)fType, selector,
 +		    args->scalarInputCount, args->structureInputSize,
 +		    args->scalarOutputCount, args->structureOutputSize);
 +	}
-+	return kIOReturnUnsupported;
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * Execute the exact s5e9925 PMUCAL g3dcore_on + exynos_pd_tz_restore + cmu_init sequence
++ * from drivers/soc/samsung/cal-if/s5e9925/pmucal/flexpmu_cal_local_s5e9925.h.
++ */
++static void
++exynos_g3dcore_power_on(vm_offset_t pmu_va)
++{
++	vm_offset_t sramhold_va = ml_io_map(EXYNOS_GPUSRAMHOLD_PA, 0x1000);
++	vm_offset_t sysreg_va   = ml_io_map(EXYNOS_G3D_SYSREG_PA, 0x1000);
++	vm_offset_t cmu_qch_va  = ml_io_map(EXYNOS_CMU_G3D_QCH_PA, 0x8000);
++	vm_offset_t cmu_va      = ml_io_map(EXYNOS_CMU_G3D_PA, 0x8000);
++	vm_offset_t dump_va     = ml_io_map(EXYNOS_G3D_DUMP_PA, 0x1000);
++	vm_offset_t strmux_va   = ml_io_map(EXYNOS_G3D_STR_MUX_PA, 0x1000);
++	vm_offset_t pwrctl_va   = ml_io_map(EXYNOS_BG3D_PWRCTL_PA, 0x1000);
++
++	if (pmu_va == 0 || cmu_va == 0 || pwrctl_va == 0) {
++		IOLog("SWEET GPU: failed to map G3D power/clock MMIO regions\n");
++		return;
++	}
++
++	/* 1. PMU_ALIVE/V_PWREN (0x15863ef0) bit 0xa -> enable external G3D regulator */
++	exynos_mmio_wr32(pmu_va, 0x3ef0, 0xa);
++	for (int i = 0; i < 10000; i++) {
++		if (exynos_mmio_rd32(pmu_va, 0x0a10) & (1U << 7)) {
++			break;
++		}
++		IODelay(1);
++	}
++	IODelay(100);
++
++	/* 2. G3DCORE_CONFIGURATION (0x15862280) = 1, wait G3DCORE_STATUS (0x15862284) */
++	exynos_mmio_rmw32(pmu_va, 0x2280, 0x1, 0x1);
++	for (int i = 0; i < 20000; i++) {
++		if (exynos_mmio_rd32(pmu_va, 0x2284) & 0x1) {
++			break;
++		}
++		IODelay(1);
++	}
++
++	/* 3. Unlock TrustZone DTZPC for G3DCORE (need_smc = 0x16c10204) BEFORE touching 0x16c* */
++	uint64_t smc_a1 = 0;
++	uint64_t smc_rc = exynos_smc(SMC_CMD_PREAPRE_PD_ONOFF,
++	    EXYNOS_WAKEUP_PD_DOWN, G3DCORE_NEED_SMC_ID, RUNTIME_PM_TZPC_GROUP, &smc_a1);
++
++	uint32_t g3d_stat = exynos_mmio_rd32(pmu_va, 0x2284);
++	uint32_t vgpio_mon = exynos_mmio_rd32(pmu_va, 0x0a10);
++	IOLog("SWEET GPU: g3dcore_on: G3DCORE_STATUS=0x%x VGPIO_MON=0x%x TZPC_SMC_RC=0x%llx (a1=0x%llx)\n",
++	    g3d_stat, vgpio_mon, smc_rc, smc_a1);
++
++	if ((g3d_stat & 0x1) == 0 || smc_rc != 0) {
++		IOLog("SWEET GPU: aborting G3D MMIO init (rail or TZPC not ready)\n");
++		return;
++	}
++
++	/* 4. GPUSRAMHOLD (0x15bb0800) */
++	if (sramhold_va != 0) {
++		exynos_mmio_rmw32(sramhold_va, 0x0800, 0xff, 0x11);
++	}
++
++	/* 5. BG3D_PWRCTL_CTL2 (0x16cd0004): request GPU power & wait for BG3D_PWRCTL_STATUS */
++	uint32_t ctl2 = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET);
++	if ((ctl2 & (1U << 5)) == 0) {
++		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x12);
++	} else {
++		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x2a);
++	}
++	/* Also assert GPUPWRREQ (0x28 / 0x2a) as in __vangogh_lite_ifpo_power_on */
++	exynos_mmio_wr32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x2a);
++
++	uint32_t pwr_status = 0;
++	for (int i = 0; i < 50000; i++) {
++		pwr_status = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
++		if ((pwr_status & 0x2) && (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY)) {
++			break;
++		}
++		IODelay(1);
++	}
++
++	/* 6. Complete g3dcore_on & g3dcore_cmu_init muxes */
++	if (dump_va != 0) {
++		exynos_mmio_rmw32(dump_va, 0x0700, 0x1, 0x1);
++	}
++	if (strmux_va != 0) {
++		exynos_mmio_rmw32(strmux_va, 0x0000, 0x1, 0x1);
++	}
++	exynos_mmio_rmw32(cmu_va, 0x0860, 0x1, 0x1); /* G3D_HCHGEN_CLKMUX_CORE */
++	if (sysreg_va != 0) {
++		exynos_mmio_wr32(sysreg_va, 0x0008, 0x6); /* vangogh_lite_gc_set_sysregs: Enable MGCG */
++	}
++
++	uint32_t pwr_lock = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_LOCK_OFFSET);
++	IOLog("SWEET GPU: BG3D_PWRCTL CTL2=0x%x STATUS=0x%x LOCK=0x%x CMU_QCH_TZPC=0x%x\n",
++	    exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET),
++	    pwr_status, pwr_lock,
++	    cmu_qch_va ? exynos_mmio_rd32(cmu_qch_va, 0x3014) : 0);
++
++	/* 7. Only read SGPU GC registers (0x16e00000) if GPU_READY (bit 31) is 1! */
++	if (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) {
++		vm_offset_t sgpu_smn = ml_io_map(EXYNOS_SGPU_SMN_PA, 0x100000);
++		if (sgpu_smn != 0) {
++			g_sgpu_grbm_status = exynos_mmio_rd32(sgpu_smn, 0x8010);
++			g_sgpu_powered = true;
++			IOLog("SWEET GPU: Xclipse 920 (RDNA2) GC awake! GRBM_STATUS=0x%08x\n",
++			    g_sgpu_grbm_status);
++		}
++	} else {
++		IOLog("SWEET GPU: BG3D_PWRCTL_STATUS GPU_READY not set (0x%08x); skipping GC MMIO read\n",
++		    pwr_status);
++	}
 +}
 +
 +static void
@@ -219,17 +457,19 @@
 +		    base_y8, shd_y8);
 +	}
 +
-+	/* Read-only check of PMU status (never touch unclocked SGPU MMIO!) */
-+	vm_offset_t pmu_page = ml_io_map(EXYNOS_PMU_BASE_PA, 0x4000);
++	vm_offset_t pmu_page = ml_io_map(EXYNOS_PMU_BASE_PA, 0x8000);
 +	if (pmu_page != 0) {
 +		uint32_t dpuf_stat = exynos_mmio_rd32(pmu_page, 0x2100 + 0x04);
 +		uint32_t g3d_stat  = exynos_mmio_rd32(pmu_page, 0x2280 + 0x04);
-+		IOLog("SWEET GPU: PMU read-only stat: pd_dpuf=0x%x pd_g3dcore=0x%x\n",
++		IOLog("SWEET GPU: PMU initial stat: pd_dpuf=0x%x pd_g3dcore=0x%x\n",
 +		    dpuf_stat, g3d_stat);
++		if (gpu_mode >= 1) {
++			exynos_g3dcore_power_on(pmu_page);
++		}
 +	}
 +
-+	/* Only publish IOAcceleratorES stub when sweetgpu=2 is passed */
-+	if (gpu_mode >= 2 && provider != NULL) {
++	/* Publish IOAcceleratorES so backboardd / Metal.framework matches it */
++	if (gpu_mode >= 1 && provider != NULL) {
 +		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
 +		if (accel != NULL) {
 +			if (!accel->init() || !accel->attach(provider) || !accel->start(provider)) {
@@ -241,7 +481,7 @@
  
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +327,7 @@
+@@ -192,7 +565,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -250,7 +490,7 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +338,7 @@
+@@ -203,6 +576,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -258,7 +498,7 @@
  	return true;
  }
  
-@@ -252,7 +388,7 @@
+@@ -252,7 +626,7 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -267,10 +507,11 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
-@@ -290,20 +426,14 @@
+@@ -289,21 +663,14 @@
+ static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
- /* Copy each enabled layer's surface into the panel memory (no scaling). */
+-/* Copy each enabled layer's surface into the panel memory (no scaling). */
 -/*
 - * A swap only records the frame: copying 10 MB into the panel on every
 - * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
@@ -291,7 +532,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +441,14 @@
+@@ -311,15 +678,12 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -303,13 +544,39 @@
  		int quiet = 0;
  		fConsolePaused = true;
  		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
- 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+-			/* Not PE_initialize_console(kPEDisableScreen): its console switch
 -			 * writes the read-only-late cons_ops_index and panics. */
-+			   writes the read-only-late cons_ops_index and panics. */
  			sweet_console_muted = 1;
  		}
  	}
-@@ -391,10 +520,16 @@
+@@ -349,6 +713,10 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		uint32_t src_bpr = (s->planeCount > 0 && s->planes[0].bytesPerRow != 0) ?
++		    s->planes[0].bytesPerRow : s->bytesPerRow;
++		uint32_t src_off = (s->planeCount > 0) ? s->planes[0].offset : s->offset;
++
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -359,7 +727,6 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+ 		if (dx < 0) {
+@@ -384,17 +751,30 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		uint64_t last = (uint64_t)src_off + (uint64_t)(sy + h - 1) * src_bpr +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -317,20 +584,27 @@
 -				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
 -				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
 -				    (size_t)w * 4);
-+			if (dx == 0 && sx == 0 && (uint32_t)w * 4 == fRowBytes && s->bytesPerRow == fRowBytes) {
++			if (s->pixelFormat == SWEET_FB_FORMAT_W30R) {
++				for (int32_t y = 0; y < h; y++) {
++					sweet_fb_copy_w30r_row(
++					    (uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const uint32_t *)(src + src_off + (uint64_t)(sy + y) * src_bpr + (uint64_t)sx * 4),
++					    (uint32_t)w);
++				}
++			} else if (dx == 0 && sx == 0 && (uint32_t)w * 4 == fRowBytes && src_bpr == fRowBytes) {
 +				sweet_fb_fast_copy((void *)(fPixels + (uint64_t)dy * fRowBytes),
-+				    (const void *)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
++				    (const void *)(src + src_off + (uint64_t)sy * src_bpr),
 +				    (size_t)h * fRowBytes);
 +			} else {
 +				for (int32_t y = 0; y < h; y++) {
 +					sweet_fb_fast_copy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-+					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (const void *)(src + src_off + (uint64_t)(sy + y) * src_bpr + (uint64_t)sx * 4),
 +					    (size_t)w * 4);
 +				}
  			}
  		}
  		s->release();
-@@ -534,7 +669,7 @@
+@@ -534,7 +914,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -339,4 +613,3 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
-
