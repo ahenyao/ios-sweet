@@ -1,6 +1,44 @@
---- a/iokit/Kernel/arm/SweetFramebuffer.cpp
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -51,6 +51,10 @@
+--- a/SweetFramebuffer.cpp
++++ b/SweetFramebuffer.cpp
+@@ -2,37 +2,6 @@
+  * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
+  * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
+  * itself) as the main display, driven by CoreAnimation's CPU renderer.
+- *
+- * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+- * device_type "display-subsystem", waits for that many services matching
+- * IOServiceMatching("IOMobileFramebuffer"), opens each with type 0 and
+- * reads canvas-width/canvas-height from the service's provider. The class
+- * here (AppleCLCD, an IOMobileFramebuffer) matches the /arm-io/disp0 nub.
+- *
+- * User client selectors used by CoreAnimation:
+- *   3  GetLayerDefaultSurface [layer, ?] -> [IOSurface port name]
+- *   4  SwapBegin -> [swap id]
+- *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+- *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+- *      +0x104 enabled layer mask
+- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+- *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
+- *   18 IsMainDisplay,
+- *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+- * Everything else is accepted and logged once.
+- *
+- * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+- * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+- * enabled it, through the port they registered (IOConnectSetNotificationPort).
+- *
+- * The panel memory itself is published as an IOSurface and returned as the
+- * default framebuffer surface. The kernel text console keeps drawing over
+- * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+- * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
+ 
+@@ -51,6 +20,10 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -11,23 +49,42 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -88,6 +92,175 @@
+@@ -70,14 +43,6 @@
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+-/*
+- * The iOS userland only has status bar / layout data for real iPhone
+- * screens (UIKit: "No status bar visual provider for screen", the red
+- * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
+- */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+@@ -87,6 +52,176 @@
+ };
  
  OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
- 
++
 +/*
-+ * Exynos 2200 (s5e9925 / g0s) G3D (Xclipse 920 / sgpu) & DECON/DPP probe
-+ * and IOAcceleratorES service stub.
++ * Exynos 2200 (s5e9925 / g0s) Display DMA (DPP0 / DECON0) & G3D probe.
++ * Confirmed on hardware:
++ *   DPP0_DMA (0x1ad00000) + 0x040 = IDMA_BASE_ADDR_Y8_0 (0xf6200000)
++ *   DPP0_DMA (0x1ad00000) + 0x440 = IDMA_BASE_ADDR_Y8_0_S (shadow, 0xf6200000)
++ *
++ * NOTE: Do NOT kick pd_g3dcore (0x15862280) or read SGPU MMIO (0x16cd0000 /
++ * 0x16e00000) until CMU_G3D clocks and TZMP SMC (0x16c10204) are initialized,
++ * otherwise reading unclocked SGPU registers triggers an AXI SError panic!
 + */
-+#define EXYNOS_PMU_DPUF_PA      0x15862100ULL
-+#define EXYNOS_PMU_G3DCORE_PA   0x15862280ULL
-+#define EXYNOS_SGPU_BASE_PA     0x16c00000ULL
-+#define EXYNOS_SGPU_PM_PA       0x16cd0000ULL
-+#define EXYNOS_SGPU_SMN_PA      0x16e00000ULL
-+#define EXYNOS_SGPU_DOORBELL_PA 0x16f00000ULL
-+#define EXYNOS_SGPU_RMEM_PA     0x8ff00000ULL
-+#define EXYNOS_DECON0_MAIN_PA   0x19f00000ULL
++#define EXYNOS_PMU_BASE_PA      0x15860000ULL
 +#define EXYNOS_DPP0_DMA_PA      0x1ad00000ULL
++#define EXYNOS_DECON0_MAIN_PA   0x19f00000ULL
++
++static vm_offset_t g_dpp0_dma_va;
++static vm_offset_t g_decon0_va;
 +
 +static inline uint32_t
 +exynos_mmio_rd32(vm_offset_t base, uint32_t off)
@@ -44,73 +101,29 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
-+static void
-+exynos_gpu_probe(void)
++/*
++ * Fast 64-byte write-combining burst copy for Normal-NC / Write-Combine memory.
++ */
++static inline void
++sweet_fb_fast_copy(void *dst, const void *src, size_t nbytes)
 +{
-+	int gpu_mode = 1;
-+	PE_parse_boot_argn("sweetgpu", &gpu_mode, sizeof(gpu_mode));
-+	if (gpu_mode == 0) {
-+		IOLog("SWEET GPU: disabled via sweetgpu=0\n");
-+		return;
++	uint64_t *d = (uint64_t *)dst;
++	const uint64_t *s = (const uint64_t *)src;
++	size_t n64 = nbytes >> 6;
++	while (n64--) {
++		uint64_t v0 = s[0], v1 = s[1], v2 = s[2], v3 = s[3];
++		uint64_t v4 = s[4], v5 = s[5], v6 = s[6], v7 = s[7];
++		d[0] = v0; d[1] = v1; d[2] = v2; d[3] = v3;
++		d[4] = v4; d[5] = v5; d[6] = v6; d[7] = v7;
++		s += 8;
++		d += 8;
 +	}
-+
-+	/* Map PMU page containing pd_dpuf (0x15862100) and pd_g3dcore (0x15862280) */
-+	vm_offset_t pmu_page = ml_io_map(0x15860000ULL, 0x4000);
-+	if (pmu_page == 0) {
-+		IOLog("SWEET GPU: failed to map PMU page 0x15860000\n");
-+		return;
++	size_t rem8 = (nbytes & 63) >> 3;
++	while (rem8--) {
++		*d++ = *s++;
 +	}
-+
-+	uint32_t dpuf_cfg  = exynos_mmio_rd32(pmu_page, 0x2100 + 0x00);
-+	uint32_t dpuf_stat = exynos_mmio_rd32(pmu_page, 0x2100 + 0x04);
-+	uint32_t g3d_cfg   = exynos_mmio_rd32(pmu_page, 0x2280 + 0x00);
-+	uint32_t g3d_stat  = exynos_mmio_rd32(pmu_page, 0x2280 + 0x04);
-+
-+	IOLog("SWEET GPU: PMU pd_dpuf cfg=0x%x stat=0x%x | pd_g3dcore cfg=0x%x stat=0x%x\n",
-+	    dpuf_cfg, dpuf_stat, g3d_cfg, g3d_stat);
-+
-+	/* If pd_g3dcore is off, try enabling local power configuration */
-+	if ((g3d_stat & 0x7) == 0) {
-+		exynos_mmio_wr32(pmu_page, 0x2280 + 0x00, 0x7);
-+		for (int i = 0; i < 10000; i++) {
-+			g3d_stat = exynos_mmio_rd32(pmu_page, 0x2280 + 0x04);
-+			if ((g3d_stat & 0x7) != 0) {
-+				break;
-+			}
-+		}
-+		IOLog("SWEET GPU: after PMU kick pd_g3dcore cfg=0x%x stat=0x%x\n",
-+		    exynos_mmio_rd32(pmu_page, 0x2280 + 0x00), g3d_stat);
-+	}
-+
-+	/* Probe DPP0 DMA (since pd_dpuf is boot-on) to find the 0xf6200000 scanout pointer */
-+	vm_offset_t dpp0_dma = ml_io_map(EXYNOS_DPP0_DMA_PA, 0x4000);
-+	if (dpp0_dma != 0) {
-+		IOLog("SWEET GPU: DPP0 DMA[0x0..0x1c]: %08x %08x %08x %08x\n",
-+		    exynos_mmio_rd32(dpp0_dma, 0x00),
-+		    exynos_mmio_rd32(dpp0_dma, 0x04),
-+		    exynos_mmio_rd32(dpp0_dma, 0x08),
-+		    exynos_mmio_rd32(dpp0_dma, 0x0c));
-+		for (uint32_t off = 0; off < 0x1000; off += 4) {
-+			uint32_t v = exynos_mmio_rd32(dpp0_dma, off);
-+			if (v == 0xf6200000U) {
-+				IOLog("SWEET GPU: found FB base 0xf6200000 in DPP0_DMA+0x%x!\n", off);
-+			}
-+		}
-+	}
-+
-+	/* Only touch SGPU MMIO if pd_g3dcore reports powered on */
-+	if ((g3d_stat & 0x7) != 0) {
-+		vm_offset_t sgpu_pm  = ml_io_map(EXYNOS_SGPU_PM_PA, 0x10000);
-+		vm_offset_t sgpu_smn = ml_io_map(EXYNOS_SGPU_SMN_PA, 0x100000);
-+		if (sgpu_pm != 0 && sgpu_smn != 0) {
-+			uint32_t pm0 = exynos_mmio_rd32(sgpu_pm, 0x00);
-+			uint32_t grbm_status = exynos_mmio_rd32(sgpu_smn, 0x8010);
-+			IOLog("SWEET GPU: Xclipse 920 active! pm0=0x%x GRBM_STATUS=0x%x\n",
-+			    pm0, grbm_status);
-+		}
-+	} else {
-+		IOLog("SWEET GPU: pd_g3dcore still gated (stat=0x%x); skipping SGPU MMIO read to avoid bus abort\n",
-+		    g3d_stat);
++	if (nbytes & 4) {
++		*(uint32_t *)d = *(const uint32_t *)s;
 +	}
 +}
 +
@@ -137,18 +150,13 @@
 +bool
 +IOAcceleratorES::start(IOService *provider)
 +{
-+	int gpu_mode = 1;
-+	PE_parse_boot_argn("sweetgpu", &gpu_mode, sizeof(gpu_mode));
-+	if (gpu_mode < 2) {
-+		return false;
-+	}
 +	if (!IOService::start(provider)) {
 +		return false;
 +	}
 +	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
 +	setProperty("IOClass", "IOAcceleratorES");
 +	registerService();
-+	IOLog("SWEET GPU: IOAcceleratorES registered\n");
++	IOLog("SWEET GPU: IOAcceleratorES service registered\n");
 +	return true;
 +}
 +
@@ -172,22 +180,68 @@
 +	return kIOReturnSuccess;
 +}
 +
++static uint64_t sweet_gpu_sel_logged;
++
 +IOReturn
 +SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
 +{
-+	char name[32];
-+	proc_selfname(name, sizeof(name));
-+	IOLog("SWEET GPU: %s sel %u in %u/%u out %u/%u\n", name, selector,
-+	    args->scalarInputCount, args->structureInputSize,
-+	    args->scalarOutputCount, args->structureOutputSize);
++	if (selector >= 64 || !(sweet_gpu_sel_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_gpu_sel_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET GPU: %s sel %u in %u/%u out %u/%u\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
 +	return kIOReturnUnsupported;
 +}
 +
++static void
++exynos_gpu_probe(IOService *provider)
++{
++	int gpu_mode = 1;
++	PE_parse_boot_argn("sweetgpu", &gpu_mode, sizeof(gpu_mode));
++	if (gpu_mode == 0) {
++		IOLog("SWEET GPU: disabled via sweetgpu=0\n");
++		return;
++	}
++
++	/* Map DPP0 DMA (0x1ad00000) and DECON0_MAIN (0x19f00000) */
++	g_dpp0_dma_va = ml_io_map(EXYNOS_DPP0_DMA_PA, 0x1000);
++	g_decon0_va   = ml_io_map(EXYNOS_DECON0_MAIN_PA, 0x1000);
++	if (g_dpp0_dma_va != 0) {
++		uint32_t base_y8 = exynos_mmio_rd32(g_dpp0_dma_va, 0x040);
++		uint32_t shd_y8  = exynos_mmio_rd32(g_dpp0_dma_va, 0x440);
++		IOLog("SWEET GPU: DPP0_DMA ready: IDMA_BASE=0x%08x SHADOW=0x%08x\n",
++		    base_y8, shd_y8);
++	}
++
++	/* Read-only check of PMU status (never touch unclocked SGPU MMIO!) */
++	vm_offset_t pmu_page = ml_io_map(EXYNOS_PMU_BASE_PA, 0x4000);
++	if (pmu_page != 0) {
++		uint32_t dpuf_stat = exynos_mmio_rd32(pmu_page, 0x2100 + 0x04);
++		uint32_t g3d_stat  = exynos_mmio_rd32(pmu_page, 0x2280 + 0x04);
++		IOLog("SWEET GPU: PMU read-only stat: pd_dpuf=0x%x pd_g3dcore=0x%x\n",
++		    dpuf_stat, g3d_stat);
++	}
++
++	/* Only publish IOAcceleratorES stub when sweetgpu=2 is passed */
++	if (gpu_mode >= 2 && provider != NULL) {
++		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
++		if (accel != NULL) {
++			if (!accel->init() || !accel->attach(provider) || !accel->start(provider)) {
++				accel->release();
++			}
++		}
++	}
++}
+ 
  class IOMobileFramebufferUserClient;
  
- class AppleCLCD : public IOMobileFramebuffer {
-@@ -192,7 +365,7 @@
+@@ -192,7 +327,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -196,15 +250,15 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +376,7 @@
+@@ -203,6 +338,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
-+	exynos_gpu_probe();
++	exynos_gpu_probe(provider);
  	return true;
  }
  
-@@ -252,7 +426,7 @@
+@@ -252,7 +388,7 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -213,13 +267,16 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
-@@ -294,16 +468,16 @@
-  * A swap only records the frame: copying 10 MB into the panel on every
-  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
-  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+@@ -290,20 +426,14 @@
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+-/*
+- * A swap only records the frame: copying 10 MB into the panel on every
+- * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+- * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
 - * default 10 Hz).
-+ * default 60 Hz).
-  */
+- */
  void
  AppleCLCD::swap(const uint8_t *rec)
  {
@@ -234,7 +291,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +485,14 @@
+@@ -311,15 +441,14 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -252,7 +309,7 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -391,10 +564,16 @@
+@@ -391,10 +520,16 @@
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -261,19 +318,19 @@
 -				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
 -				    (size_t)w * 4);
 +			if (dx == 0 && sx == 0 && (uint32_t)w * 4 == fRowBytes && s->bytesPerRow == fRowBytes) {
-+				memcpy((void *)(fPixels + (uint64_t)dy * fRowBytes),
++				sweet_fb_fast_copy((void *)(fPixels + (uint64_t)dy * fRowBytes),
 +				    (const void *)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
 +				    (size_t)h * fRowBytes);
 +			} else {
 +				for (int32_t y = 0; y < h; y++) {
-+					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					sweet_fb_fast_copy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
 +					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
 +					    (size_t)w * 4);
 +				}
  			}
  		}
  		s->release();
-@@ -534,7 +713,7 @@
+@@ -534,7 +669,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -282,3 +339,4 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
+
