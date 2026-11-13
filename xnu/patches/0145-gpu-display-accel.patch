@@ -1,0 +1,285 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,10 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" {
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++}
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -88,6 +92,175 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * Exynos 2200 (s5e9925 / g0s) G3D (Xclipse 920 / sgpu) & DECON/DPP probe
++ * and IOAcceleratorES service stub.
++ */
++#define EXYNOS_PMU_DPUF_PA      0x15862100ULL
++#define EXYNOS_PMU_G3DCORE_PA   0x15862280ULL
++#define EXYNOS_SGPU_BASE_PA     0x16c00000ULL
++#define EXYNOS_SGPU_PM_PA       0x16cd0000ULL
++#define EXYNOS_SGPU_SMN_PA      0x16e00000ULL
++#define EXYNOS_SGPU_DOORBELL_PA 0x16f00000ULL
++#define EXYNOS_SGPU_RMEM_PA     0x8ff00000ULL
++#define EXYNOS_DECON0_MAIN_PA   0x19f00000ULL
++#define EXYNOS_DPP0_DMA_PA      0x1ad00000ULL
++
++static inline uint32_t
++exynos_mmio_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++exynos_mmio_wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++exynos_gpu_probe(void)
++{
++	int gpu_mode = 1;
++	PE_parse_boot_argn("sweetgpu", &gpu_mode, sizeof(gpu_mode));
++	if (gpu_mode == 0) {
++		IOLog("SWEET GPU: disabled via sweetgpu=0\n");
++		return;
++	}
++
++	/* Map PMU page containing pd_dpuf (0x15862100) and pd_g3dcore (0x15862280) */
++	vm_offset_t pmu_page = ml_io_map(0x15860000ULL, 0x4000);
++	if (pmu_page == 0) {
++		IOLog("SWEET GPU: failed to map PMU page 0x15860000\n");
++		return;
++	}
++
++	uint32_t dpuf_cfg  = exynos_mmio_rd32(pmu_page, 0x2100 + 0x00);
++	uint32_t dpuf_stat = exynos_mmio_rd32(pmu_page, 0x2100 + 0x04);
++	uint32_t g3d_cfg   = exynos_mmio_rd32(pmu_page, 0x2280 + 0x00);
++	uint32_t g3d_stat  = exynos_mmio_rd32(pmu_page, 0x2280 + 0x04);
++
++	IOLog("SWEET GPU: PMU pd_dpuf cfg=0x%x stat=0x%x | pd_g3dcore cfg=0x%x stat=0x%x\n",
++	    dpuf_cfg, dpuf_stat, g3d_cfg, g3d_stat);
++
++	/* If pd_g3dcore is off, try enabling local power configuration */
++	if ((g3d_stat & 0x7) == 0) {
++		exynos_mmio_wr32(pmu_page, 0x2280 + 0x00, 0x7);
++		for (int i = 0; i < 10000; i++) {
++			g3d_stat = exynos_mmio_rd32(pmu_page, 0x2280 + 0x04);
++			if ((g3d_stat & 0x7) != 0) {
++				break;
++			}
++		}
++		IOLog("SWEET GPU: after PMU kick pd_g3dcore cfg=0x%x stat=0x%x\n",
++		    exynos_mmio_rd32(pmu_page, 0x2280 + 0x00), g3d_stat);
++	}
++
++	/* Probe DPP0 DMA (since pd_dpuf is boot-on) to find the 0xf6200000 scanout pointer */
++	vm_offset_t dpp0_dma = ml_io_map(EXYNOS_DPP0_DMA_PA, 0x4000);
++	if (dpp0_dma != 0) {
++		IOLog("SWEET GPU: DPP0 DMA[0x0..0x1c]: %08x %08x %08x %08x\n",
++		    exynos_mmio_rd32(dpp0_dma, 0x00),
++		    exynos_mmio_rd32(dpp0_dma, 0x04),
++		    exynos_mmio_rd32(dpp0_dma, 0x08),
++		    exynos_mmio_rd32(dpp0_dma, 0x0c));
++		for (uint32_t off = 0; off < 0x1000; off += 4) {
++			uint32_t v = exynos_mmio_rd32(dpp0_dma, off);
++			if (v == 0xf6200000U) {
++				IOLog("SWEET GPU: found FB base 0xf6200000 in DPP0_DMA+0x%x!\n", off);
++			}
++		}
++	}
++
++	/* Only touch SGPU MMIO if pd_g3dcore reports powered on */
++	if ((g3d_stat & 0x7) != 0) {
++		vm_offset_t sgpu_pm  = ml_io_map(EXYNOS_SGPU_PM_PA, 0x10000);
++		vm_offset_t sgpu_smn = ml_io_map(EXYNOS_SGPU_SMN_PA, 0x100000);
++		if (sgpu_pm != 0 && sgpu_smn != 0) {
++			uint32_t pm0 = exynos_mmio_rd32(sgpu_pm, 0x00);
++			uint32_t grbm_status = exynos_mmio_rd32(sgpu_smn, 0x8010);
++			IOLog("SWEET GPU: Xclipse 920 active! pm0=0x%x GRBM_STATUS=0x%x\n",
++			    pm0, grbm_status);
++		}
++	} else {
++		IOLog("SWEET GPU: pd_g3dcore still gated (stat=0x%x); skipping SGPU MMIO read to avoid bus abort\n",
++		    g3d_stat);
++	}
++}
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class SweetAcceleratorUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetAcceleratorUserClient);
++	task_t fTask;
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAcceleratorUserClient, IOUserClient);
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	int gpu_mode = 1;
++	PE_parse_boot_argn("sweetgpu", &gpu_mode, sizeof(gpu_mode));
++	if (gpu_mode < 2) {
++		return false;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
++	setProperty("IOClass", "IOAcceleratorES");
++	registerService();
++	IOLog("SWEET GPU: IOAcceleratorES registered\n");
++	return true;
++}
++
++bool
++SweetAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET GPU: %s opened IOAcceleratorES user client (type %u)\n", name, (uint32_t)type);
++	return true;
++}
++
++IOReturn
++SweetAcceleratorUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET GPU: %s sel %u in %u/%u out %u/%u\n", name, selector,
++	    args->scalarInputCount, args->structureInputSize,
++	    args->scalarOutputCount, args->structureOutputSize);
++	return kIOReturnUnsupported;
++}
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -192,7 +365,7 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -203,6 +376,7 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	exynos_gpu_probe();
+ 	return true;
+ }
+ 
+@@ -252,7 +426,7 @@
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	if ((count % 30) == 0) { uint32_t hbv = ((count / 30) & 1) ? 0xffffffff : 0xff00ff00; for (uint32_t hy = 0; hy < 120; hy++) { volatile uint32_t *hbr = (volatile uint32_t *)(fb->fPixels + (uint64_t)hy * fb->fRowBytes); for (uint32_t hx = 0; hx < 120; hx++) { hbr[hx] = hbv; } } } if (rec != NULL) {
++	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+@@ -294,16 +468,16 @@
+  * A swap only records the frame: copying 10 MB into the panel on every
+  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+- * default 10 Hz).
++ * default 60 Hz).
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	uint32_t mask = get32(rec, 0x104); IOLockLock(fLock);
++	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fDirty = true; static uint32_t dbgs, dbgz; const uint32_t pal[4] = { 0xffffffff, 0xffff00ff, 0xff00ffff, 0xffffff00 }; dbgs++; bool realid = get32(rec, 0x54) || get32(rec, 0x58) || get32(rec, 0x5c) || get32(rec, 0x60); if (dbgs <= 40 || (realid && dbgz++ < 40)) { IOLog("SWEET FB: swap-in #%u id %u mask 0x%x ids %u %u %u %u\n", dbgs, get32(rec, 0x50), get32(rec, 0x104), get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60)); } for (uint32_t sy = 0; sy < 120; sy++) { volatile uint32_t *srw = (volatile uint32_t *)(fPixels + (uint64_t)sy * fRowBytes); for (uint32_t sx = 130; sx < 250; sx++) { srw[sx] = pal[dbgs & 3]; } if (realid) { for (uint32_t gx = 260; gx < 380; gx++) { srw[gx] = 0xff00ff00; } } }
++	fDirty = true;
+ 	IOLockUnlock(fLock);
+-	if ((++sweet_fb_swap_count % 20) == 0) {
++	if ((++sweet_fb_swap_count % 300) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+@@ -311,15 +485,14 @@
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+-	uint32_t mask = get32(rec, 0x104); static uint32_t dbgn; if (dbgn++ < 40) { IOLog("SWEET FB: present swap %u mask 0x%x ids %u %u %u %u\n", get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60)); } if (dbgn == 1) { for (uint32_t ty = 0; ty < fHeight; ty++) { volatile uint32_t *trow = (volatile uint32_t *)(fPixels + (uint64_t)ty * fRowBytes); for (uint32_t tx = 0; tx < fWidth; tx++) { trow[tx] = 0xffff0000; } } } if (get32(rec, 0x54) || get32(rec, 0x58) || get32(rec, 0x5c) || get32(rec, 0x60)) { for (uint32_t qy = 0; qy < 120; qy++) { volatile uint32_t *qrw = (volatile uint32_t *)(fPixels + (uint64_t)qy * fRowBytes); for (uint32_t qx = 260; qx < 380; qx++) { qrw[qx] = 0xff00ff00; } } }
+-
++	uint32_t mask = get32(rec, 0x104);
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+ 		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+-			 * writes the read-only-late cons_ops_index and panics. */
++			   writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
+@@ -391,10 +564,16 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			if (dx == 0 && sx == 0 && (uint32_t)w * 4 == fRowBytes && s->bytesPerRow == fRowBytes) {
++				memcpy((void *)(fPixels + (uint64_t)dy * fRowBytes),
++				    (const void *)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
++				    (size_t)h * fRowBytes);
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
+ 			}
+ 		}
+ 		s->release();
+@@ -534,7 +713,7 @@
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+-			bool off = false;
++			bool off = (args->scalarInput[0] == 0);
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+
