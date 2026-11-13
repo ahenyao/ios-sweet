@@ -1,5 +1,5 @@
---- a/SweetFramebuffer.cpp
-+++ b/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -2,37 +2,6 @@
   * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
   * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
