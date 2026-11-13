@@ -14,3 +14,7 @@ ios16-root.img
 ios16-root.simg
 payload.bin
 shim/payload.bin
+
+android_system_tools_mkbootimg/
+uniLoader/
+

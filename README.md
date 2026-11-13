@@ -1,10 +1,12 @@
-# ios-sweet
+# ios-g0s
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+**Apple's iOS 16 running on a Samsung Galaxy S22+ (Exynos).**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Samsung Galaxy S22+ (`g0s`, Exynos 2200). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+As of **2026-10-28** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+
+As of **2026-10-31** the phone shows up as a USB network card and `tools/sweet-usbnet.sh` is working.
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
 
@@ -12,53 +14,66 @@ As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock 
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
+| Boot | Stock Samsung bootloader → uniLoader  flashed to the boot partition → shim execution → XNU. |
+| CPU | All 8 cores (1x Cortex-X2; 3x Cortex-A710; 4x Cortex-A510) |
+| Memory | About 5.98 GiB of the upper DDR bank |
 | Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
 | Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
+| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center |
+| Apps | Settings, iMessage, Safari, Photos |
+| Touch | STMicroelectronics FTS2BA61Y over SPI, delivered as HID digitizer events |
+| Buttons | Power, volume up/down |
+| Battery | IOPMPowerSource service (static 100 %, charging icon) |
+| USB | USB gadget network interface and logs via `tools/sweet-usbnet.sh` |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 | Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
 
 ## What does not work (yet)
 
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
 - **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
+- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps.
 - **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
 - **Slow boot:** about 4 minutes on the Apple logo.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
+- **Powering off the device:** kernel panics when trying to power off.
 
 ## How it boots
 
 ```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
+S-Boot (stock Samsung bootloader, unlocked, tripped Knox)
+  -> boot partition image
      -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
         -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
            -> XNU -> UFS driver -> HFS+ root in the userdata partition
               -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
 ```
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
+There is no exposed serial port. The kernel draws its console into the framebuffer that S-Boot leaves at `0xf6200000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from TWRP with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
 
 ## How to do it yourself
 
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
+You need a Galaxy S22+ (`g0s`, Exynos CPU variant, in my case SM-S906B) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
 
 ### 0. Back up the phone
 
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
+Flash TWRP (or any recovery with adb root) and pull
+```
+blcmd     debug   fmp_selftest  nad_refer   prism     spu       vbmeta
+boot      dqmdbg  harx          omr         radio     steady    vbmeta_system
+bota      dtbo    keyrefuge     optics      recovery  uhcfg     vendor_boot
+cp_debug  efs     keystorage    param       reserved  uh
+cpefs     epbl    misc          persistent  sec_efs   up_param
+```
+They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
 
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
+The shim needs the stock DTB. Unpack your phone's stock `vendor_boot.img`:
 
 ```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
+git clone https://github.com/LineageOS/android_system_tools_mkbootimg.git
+python3 android_system_tools_mkbootimg/unpack_bootimg.py --format mkbootimg --boot_img backup/vendor_boot.img --out dtb/boot_unpacked
+mv dtb/boot_unpacked/dtb dtb/boot_unpacked/dtb.original
+python3 tools/g0s-dtb-extract.py dtb/boot_unpacked/dtb.original dtb/boot_unpacked/dtb
 ```
 
 ### 1. Build the kernel
@@ -66,8 +81,8 @@ python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot
 The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
 
 ```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
+gh workflow run xnu.yml -R YOU/ios-g0s
+gh run download RUN_ID -R YOU/ios-g0s -n xnu-kernel -D xnu/out
 ```
 
 To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
@@ -100,10 +115,11 @@ ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im
 Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
 
 ```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
+python3 tools/mkadt.py xnu/out/adt.img --highmem
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet xnu/out/adt.img shim/out/payload.bin \
+    --cmdline "debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsroot=userdata ufswait=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 amfi_get_out_of_my_way=1 cs_enforce=0 cs_enforcement_disable=1 sweetfb_native=0 sweetfb_noconsole=1 sweetfb_hz=30 sweetkeys=0 sweettouch=1 sweetusb=2 sweetbattery=0"
+
+shim/build.sh ../shim/out/payload.bin
 ```
 
 What the less obvious boot-args do:
@@ -111,29 +127,65 @@ What the less obvious boot-args do:
 | Boot-arg | Effect |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
+| `cpus=8` | Start all the 8 cores; `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
 | `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
 | `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
 | `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
 
-### 4. Flash the root and boot
-
 ```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
+python3 android_system_tools_mkbootimg/unpack_bootimg.py --boot_img backup/boot.img --format mkbootimg
+# Example output:
+# --header_version 4 --os_version 12.0.0 --os_patch_level 2025-09 --kernel out/kernel --ramdisk out/ramdisk --cmdline ''
+```
+Note this output somewhere and replace:
+* `out/kernel` with `uniLoader`
+* `out/ramdisk` with `empty_ramdisk`
+
+Add this to the end:
+`--out boot-uniLoader.img`
+
+Example result:
+```
+--header_version 4 --os_version 12.0.0 --os_patch_level 2025-09 --kernel uniLoader --ramdisk empty_ramdisk --cmdline '' --out boot-uniLoader.img
 ```
 
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
+
+```sh
+git clone https://github.com/ivoszbg/uniLoader.git
+cd uniLoader
+cp ../shim/out/Image ./blob/Image
+cp ../shim/out/ramdisk.bin ./blob/ramdisk
+cp ../dtb/boot_unpacked/dtb ./blob/dtb
+
+make ARCH=aarch64 CROSS_COMPILE=aarch64-linux-gnu- g0s_defconfig
+make ARCH=aarch64 CROSS_COMPILE=aarch64-linux-gnu-
+
+touch empty_ramdisk
+../android_system_tools_mkbootimg/mkbootimg.py <--header_version 4 ...>
+cd ..
+```
+
+
+
+### 4. Flash the root and boot (via TWRP or other recovery)
+
+Boot into TWRP and press Reboot > Fastboot.
+
+```sh
+fastboot -S 128M flash userdata ios16-root.simg   # ~10 minutes; do not unplug
+fastboot flash boot uniLoader/boot-uniLoader.img
+```
+
+The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to recovery, hold Power + Volume down for ~7 seconds until the screen blanks, then immediately hold Power + Volume up (phone must be connected via USB cable to the PC).
 
 ### 5. Read the kernel log
 
+Boot into TWRP or other recovery and run:
+
 ```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
 tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
 ```
 
 The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
@@ -189,15 +241,14 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 
 ## Key hardware facts
 
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
+- RAM: payloads use the upper bank, `0x880000000` + `0x17ec00000` (about 5.98 GiB), above Samsung's protected carve-outs.
+- GICv3 (`0x10200000` / `0x10240000`) with security extensions: virtual timer INTID 27, 25.6 MHz timebase, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
+- Panel: 1080×2340 video mode, continuous splash from S-Boot (`0xf6200000`), no refresh kick needed.
+- Touch: STMicroelectronics FTS2BA61Y bit-banged over SPI2 on PERIC2 GPIO `GPP2` (`0x11c30000`), interrupt on ALIVE `GPA1-2` (`0x15850000`).
+- Buttons: polled active-low on ALIVE GPIO `GPA0` (`0x15850000`): power on `GPA0-1`, volume up on `GPA0-2`, volume down on `GPA0-3`.
 
 More in [`NOTES.md`](NOTES.md).
 
 ## Credits
 
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Samsung/LineageOS published Linux kernel sources for the hardware details, and [TWRP](https://github.com/milxnaq/android_device_samsung_s5e9925). iOS itself is Apple's and is not distributed here.
