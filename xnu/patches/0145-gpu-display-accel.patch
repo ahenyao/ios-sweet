@@ -1,6 +1,24 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -41,11 +41,12 @@
+@@ -10,6 +10,7 @@
+  *   sel 0   create: scalar [parent id], struct in = serialized property
+  *           dictionary (binary or XML), struct out = lock result (0xa68)
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
++ *   sel 32  get graphics commpage address: scalar out [task VA]
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+@@ -21,9 +22,6 @@
+  * sweet_surface_fill_result). Every surface is wired kernel memory mapped
+  * into each task that creates or looks it up; mappings are counted per
+  * client and dropped on release or close.
+- *
+- * Values, notifications, accelerators and shared events are accepted and
+- * ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
+ 
+@@ -41,20 +39,25 @@
  #include <sys/proc.h>
  
  enum {
@@ -11,38 +29,100 @@
 -	kSweetSurfaceCreatePort         = 35,
 +	kSweetSurfaceCreate                     = 0,
 +	kSweetSurfaceLookup                     = 4,
++	kSweetSurfaceSetValue                   = 9,
++	kSweetSurfaceCopyValue                  = 10,
++	kSweetSurfaceRemoveValue                = 11,
 +	kSweetSurfaceLimits                     = 13,
++	kSweetSurfaceSetBulkAttachments         = 27,
 +	kSweetSurfaceGetGraphicsCommPageAddress = 32,
 +	kSweetSurfaceLookupFromPort             = 34,
 +	kSweetSurfaceCreatePort                 = 35,
  };
  
  enum {
-@@ -68,6 +69,7 @@
+-	kSweetSurfaceTrapIncrementUse   = 0,
+-	kSweetSurfaceTrapDecrementUse   = 1,
+-	kSweetSurfaceTrapLock           = 2,
+-	kSweetSurfaceTrapUnlock         = 3,
+-	kSweetSurfaceTrapRelease        = 4,
+-	kSweetSurfaceTrapReleaseFailed  = 5,
++	kSweetSurfaceTrapIncrementUse  = 0,
++	kSweetSurfaceTrapDecrementUse  = 1,
++	kSweetSurfaceTrapLock          = 2,
++	kSweetSurfaceTrapUnlock        = 3,
++	kSweetSurfaceTrapRelease       = 4,
++	kSweetSurfaceTrapReleaseFailed = 5,
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xa68
+@@ -67,12 +70,13 @@
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
  #define kIOSurfaceLockReadOnly          0x1
  
- static IOLock       *sweet_surface_lock;
+-static IOLock       *sweet_surface_lock;
+-static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+-static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+-static uint32_t      sweet_surface_next_id = 1;
+-static uint32_t      sweet_surface_creates_logged;
+-static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static IOLock                   *sweet_surface_lock;
 +static IOBufferMemoryDescriptor *sweet_surface_commpage;
- static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
- static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
- static uint32_t      sweet_surface_next_id = 1;
-@@ -393,6 +395,7 @@
++static SweetSurface             *sweet_surface_table[SWEET_SURFACE_MAX_ID];
++static uint32_t                  sweet_surface_users[SWEET_SURFACE_MAX_ID];
++static uint32_t                  sweet_surface_next_id = 1;
++static uint32_t                  sweet_surface_creates_logged;
++static uint64_t                  sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -125,7 +129,10 @@
+ 			s->retain();
+ 			sweet_surface_table[id] = s;
+ 			sweet_surface_users[id] = 1;
+-			*(uint64_t *)s->state->getBytesNoCopy() = id;   /* registry id */
++			uint8_t *st = (uint8_t *)s->state->getBytesNoCopy();
++			*(uint64_t *)st = id;                   /* registry id */
++			*(uint32_t *)(st + 0x20) = 1;           /* value generation (odd, non-zero) */
++			st[0x2d] = 1;                           /* displayable */
+ 			return true;
+ 		}
+ 	}
+@@ -393,6 +400,13 @@
  		return false;
  	}
  	sweet_surface_init_lock();
-+
++	if (sweet_surface_commpage == NULL) {
++		sweet_surface_commpage = IOBufferMemoryDescriptor::inTaskWithOptions(
++		    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++		if (sweet_surface_commpage != NULL) {
++			bzero(sweet_surface_commpage->getBytesNoCopy(), page_size);
++		}
++	}
  	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
  	registerService();
  	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
-@@ -405,6 +408,7 @@
- 	task_t   fTask;
- 	IOLock  *fLock;
- 	OSArray *fRefs;
+@@ -402,9 +416,10 @@
+ class IOSurfaceRootUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOSurfaceRootUserClient);
+ 
+-	task_t   fTask;
+-	IOLock  *fLock;
+-	OSArray *fRefs;
++	task_t       fTask;
++	IOLock      *fLock;
++	OSArray     *fRefs;
 +	IOMemoryMap *fCommPageMap;
  
  	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
  	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
-@@ -458,6 +462,7 @@
+@@ -452,12 +467,14 @@
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
++	fCommPageMap = NULL;
+ 	return fLock != NULL && fRefs != NULL;
+ }
+ 
  void
  IOSurfaceRootUserClient::free()
  {
@@ -50,10 +130,88 @@
  	OSSafeReleaseNULL(fRefs);
  	if (fLock != NULL) {
  		IOLockFree(fLock);
-@@ -772,6 +777,25 @@
- 		sweet_surf_log_once("sel", selector);
- 		return kIOReturnSuccess;
+@@ -471,6 +488,7 @@
+ {
+ 	IOLockLock(fLock);
+ 	fRefs->flushCollection();
++	OSSafeReleaseNULL(fCommPageMap);
+ 	IOLockUnlock(fLock);
+ 	terminate();
+ 	return kIOReturnSuccess;
+@@ -495,13 +513,6 @@
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
+- *
+- * A lookup of a surface this client already has maps nothing and counts
+- * nothing (*existing): IOSurface.framework then gets base address -1 in the
+- * lock result and reuses its cached IOSurfaceClient. Counting it instead
+- * made the framework build a second client for the same id; releasing that
+- * one (traps 4 + 5) unmapped the memory under the first (backboardd
+- * snapshot crash in CGDataProviderCreateWithData).
+  */
+ IOReturn
+ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing)
+@@ -536,7 +547,6 @@
+ 	IOLockLock(fLock);
+ 	SweetSurfaceRef *raced = findRef(s->id, NULL);
+ 	if (raced != NULL && raced->surface == s) {
+-		/* Another thread mapped it meanwhile: count there, drop ours. */
+ 		raced->count++;
+ 		IOLockUnlock(fLock);
+ 		ref->release();
+@@ -640,7 +650,6 @@
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
  	}
+ 	if (ret != kIOReturnSuccess && !existing) {
+-		/* The caller never learns the id: undo this create/lookup. */
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+ 	return ret;
+@@ -749,6 +758,65 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+ 	}
++	case kSweetSurfaceSetValue:
++	case kSweetSurfaceRemoveValue: {
++		uint32_t gen = 3;
++		if (args->structureInput != NULL && args->structureInputSize >= 4) {
++			uint32_t sid = 0;
++			memcpy(&sid, args->structureInput, 4);
++			SweetSurface *s = sweet_surface_copy(sid);
++			if (s != NULL && s->state != NULL) {
++				uint8_t *st = (uint8_t *)s->state->getBytesNoCopy();
++				uint32_t cur = *(uint32_t *)(st + 0x20);
++				gen = ((cur + 2) | 1U);
++				*(uint32_t *)(st + 0x20) = gen;
++				s->release();
++			}
++		}
++		if (args->structureOutput != NULL && args->structureOutputSize >= 4) {
++			memcpy(args->structureOutput, &gen, 4);
++			args->structureOutputSize = 4;
++		}
++		if (args->scalarOutputCount > 0) {
++			args->scalarOutput[0] = gen;
++		}
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++	case kSweetSurfaceSetBulkAttachments: {
++		if (args->structureInput != NULL && args->structureInputSize >= 0x84) {
++			const uint8_t *in = (const uint8_t *)args->structureInput;
++			uint32_t sid = 0;
++			memcpy(&sid, in + 0x80, 4);
++			SweetSurface *s = sweet_surface_copy(sid);
++			if (s != NULL && s->state != NULL) {
++				uint8_t *st = (uint8_t *)s->state->getBytesNoCopy();
++				memcpy(st + 0x30, in, 0x70);
++				s->release();
++			}
++		}
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
 +	case kSweetSurfaceGetGraphicsCommPageAddress: {
 +		if (args->scalarOutputCount < 1 || sweet_surface_commpage == NULL) {
 +			return kIOReturnBadArgument;
@@ -73,19 +231,28 @@
 +		sweet_surf_log_once("sel", selector);
 +		return kIOReturnSuccess;
 +	}
+ 	case kSweetSurfaceLookupFromPort: {
+ 		OSObject *obj = NULL;
+ 		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
+@@ -773,7 +841,6 @@
+ 		return kIOReturnSuccess;
+ 	}
  	default:
- 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
  		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+ 		}
 
 
 
 
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -2,37 +2,6 @@
+@@ -1,38 +1,8 @@
+ /*
   * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
   * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
-  * itself) as the main display, driven by CoreAnimation's CPU renderer.
+- * itself) as the main display, driven by CoreAnimation's CPU renderer.
 - *
 - * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
 - * device_type "display-subsystem", waits for that many services matching
@@ -117,10 +284,12 @@
 - * default framebuffer surface. The kernel text console keeps drawing over
 - * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
 - * the first swap on (it still reaches the persistent log; panics draw).
++ * itself) as the main display, plus the Exynos 2200 Xclipse 920 (sgpu)
++ * G3DCORE bring-up and AGXAccelerator / IOGPU Metal user-client bridge.
   */
  #include "SweetSurface.h"
  
-@@ -51,6 +20,10 @@
+@@ -51,6 +21,10 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -131,7 +300,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,23 +43,677 @@
+@@ -70,23 +44,749 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -173,6 +342,7 @@
 +#define EXYNOS_DECON0_MAIN_PA           0x19f00000ULL
 +
 +#define SMC_CMD_PREAPRE_PD_ONOFF        0x82000410ULL
++#define SMC_CMD_SGPU_FW_BOOT            0x82000520ULL
 +#define EXYNOS_WAKEUP_PD_DOWN           1ULL
 +#define G3DCORE_NEED_SMC_ID             0x16c10204ULL
 +#define RUNTIME_PM_TZPC_GROUP           2ULL
@@ -182,6 +352,11 @@
 +#define BG3D_PWRCTL_STATUS_OFFSET       0x08
 +#define BG3D_PWRCTL_LOCK_OFFSET         0x0c
 +#define BG3D_PWRCTL_STATUS_GPU_READY    0x80000000U
++
++/* GC_BASE offsets on vangogh_lite (SEG0 = 0x1260 dwords, SEG1 = 0xa000 dwords) */
++#define SGPU_MM_GRBM_STATUS             0x08010U        /* 4 * (0x1260 + 0x0da4) */
++#define SGPU_MM_RLC_CNTL                0x3b000U        /* 4 * (0xa000 + 0x4c00) */
++#define SGPU_MM_RLC_BOOTLOAD_STATUS     0x3ba34U        /* 4 * (0xa000 + 0x4e8d) */
 +
 +static vm_offset_t g_pmu_va;
 +static vm_offset_t g_dpp0_dma_va;
@@ -365,10 +540,31 @@
 +	return true;
 +}
 +
++static int g_backboardd_first_pid;
++
 +IOReturn
 +AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
 +    __unused OSDictionary *properties, IOUserClient **handler)
 +{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	int pid = proc_selfpid();
++
++	/*
++	 * Safety net: if backboardd opened AGXAccelerator in a previous PID and
++	 * crashed, fall back to CoreAnimation's SWContext on respawn so the phone
++	 * always boots into the UI instead of looping.
++	 */
++	if (strcmp(name, "backboardd") == 0) {
++		if (g_backboardd_first_pid == 0) {
++			g_backboardd_first_pid = pid;
++		} else if (g_backboardd_first_pid != pid) {
++			IOLog("SWEET GPU: backboardd[%d] respawned after PID %d; falling back to SW renderer\n",
++			    pid, g_backboardd_first_pid);
++			return kIOReturnUnsupported;
++		}
++	}
++
 +	SweetAcceleratorUserClient *client = OSTypeAlloc(SweetAcceleratorUserClient);
 +	if (client == NULL) {
 +		return kIOReturnNoMemory;
@@ -402,7 +598,8 @@
 +	}
 +	char name[32];
 +	proc_selfname(name, sizeof(name));
-+	IOLog("SWEET GPU: %s opened AGXAccelerator user client (type 0x%x)\n", name, (uint32_t)type);
++	IOLog("SWEET GPU: %s[%d] opened AGXAccelerator user client (type 0x%x)\n",
++	    name, proc_selfpid(), (uint32_t)type);
 +	return fLock != NULL && fStatusMap != NULL;
 +}
 +
@@ -552,6 +749,11 @@
 +	bzero(tmpOut, sizeof(tmpOut));
 +
 +	switch (selector) {
++	case 0: { /* _IOGPUDeviceGetName (out 0x40) */
++		static const char kDevName[] = "Apple A11 GPU";
++		memcpy(tmpOut, kDevName, sizeof(kDevName));
++		break;
++	}
 +	case 2: { /* _IOGPUDeviceCreateWithAPIProperty -> getConfig (0x218 bytes) */
 +		uint64_t statusVA = fStatusMap != NULL ? fStatusMap->getAddress() : 0;
 +		uint32_t count = 1;
@@ -567,6 +769,14 @@
 +		memcpy(tmpOut + 0x70, &ramSize, 8);
 +		memcpy(tmpOut + 0x78, &accelID, 4);
 +		memcpy(tmpOut + 0x80, &ramSize, 8);
++		break;
++	}
++	case 4: { /* _IOGPUDeviceGetMemoryData / MaxResourceSize (out 0x20) */
++		uint64_t maxRes = 0x40000000ULL;
++		memcpy(tmpOut + 0x00, &maxRes, 8);
++		memcpy(tmpOut + 0x08, &maxRes, 8);
++		memcpy(tmpOut + 0x10, &maxRes, 8);
++		memcpy(tmpOut + 0x18, &maxRes, 8);
 +		break;
 +	}
 +	case 6: /* setAPIProperty ("Metal") */
@@ -646,6 +856,33 @@
 +	}
 +	case 25: /* setCommandQueueNotificationQueue */
 +	case 26: /* _IOGPUCommandQueueSubmitCommandBuffers */
++		break;
++	case 256: { /* 0x100: AGXGPUCoreConfig (out 0x78 = 120 bytes into x20 + 0x268) */
++		uint32_t numCores = 3;
++		uint32_t coreMask = 0x7;
++		uint32_t rev      = 0x30008; /* G10P */
++		uint32_t sub      = 1;
++		memcpy(tmpOut + 0x00, &numCores, 4);
++		memcpy(tmpOut + 0x04, &coreMask, 4);
++		memcpy(tmpOut + 0x08, &rev, 4);
++		memcpy(tmpOut + 0x0c, &sub, 4);
++		memcpy(tmpOut + 0x10, &numCores, 4);
++		memcpy(tmpOut + 0x14, &sub, 4);
++		break;
++	}
++	case 258: { /* 0x102: checkDeviceConnectionSanity (out 0x1c8 = 456 bytes) */
++		/*
++		 * 0x209e15084 reads C string at +0xe8 and 0x209e1528c checks for
++		 * substring "release". If missing, w24 = 0 and AGXA11FamilyDevice
++		 * aborts and crashes in ~Device().
++		 */
++		static const char kKmdFeatures[] = "release,g10p,agx";
++		static const char kKmdVersion[]  = "227.6.5";
++		memcpy(tmpOut + 0x00, kKmdVersion, sizeof(kKmdVersion));
++		memcpy(tmpOut + 0xe8, kKmdFeatures, sizeof(kKmdFeatures));
++		break;
++	}
++	case 263: /* 0x107: setupImmediate async notification registration */
 +	default:
 +		break;
 +	}
@@ -676,7 +913,26 @@
 +		return;
 +	}
 +
-+	/* Unlock TrustZone DTZPC for G3DCORE before accessing 0x16c00000..0x16cd0000 */
++	/* 1. PMUCAL_SET_BIT_ATOMIC("PMU_ALIVE/V_PWREN", 0x15860000, 0x3ef0, 0xa) */
++	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3ef0, 0xa);
++	for (int i = 0; i < 50000; i++) {
++		if (exynos_mmio_rd32(g_pmu_va, 0x0a10) & (1U << 7)) {
++			break;
++		}
++		IODelay(1);
++	}
++	IODelay(60);
++
++	/* 2. G3DCORE_CONFIGURATION (0x15862280) = 1, wait G3DCORE_STATUS (0x15862284) */
++	exynos_mmio_rmw32(g_pmu_va, 0x2280, 0x1, 0x1);
++	for (int i = 0; i < 50000; i++) {
++		if (exynos_mmio_rd32(g_pmu_va, 0x2284) & 0x1) {
++			break;
++		}
++		IODelay(1);
++	}
++
++	/* 3. Unlock TrustZone DTZPC for G3DCORE AFTER G3DCORE_STATUS == 1 */
 +	uint64_t smc_a1 = 0;
 +	uint64_t smc_rc = exynos_smc(SMC_CMD_PREAPRE_PD_ONOFF,
 +	    EXYNOS_WAKEUP_PD_DOWN, G3DCORE_NEED_SMC_ID, RUNTIME_PM_TZPC_GROUP, &smc_a1);
@@ -691,30 +947,11 @@
 +		return;
 +	}
 +
-+	/* 1. PLL_CON0_PLL_G3D & PLL_CON1_PLL_G3D from g3dcore_on_evt1_1[] */
++	/* 4. PLL_CON0_PLL_G3D & PLL_CON1_PLL_G3D from g3dcore_on_evt1_1[] */
 +	exynos_mmio_rmw32(cmu_va, 0x0100, (1U << 4), 0);
 +	exynos_mmio_wr32(cmu_va, 0x0104, 0x38000002U);
 +
-+	/* 2. PMUCAL_SET_BIT_ATOMIC("PMU_ALIVE/V_PWREN", 0x15860000, 0x3ef0, 0xa) */
-+	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3ef0, 0xa);
-+	for (int i = 0; i < 50000; i++) {
-+		if (exynos_mmio_rd32(g_pmu_va, 0x0a10) & (1U << 7)) {
-+			break;
-+		}
-+		IODelay(1);
-+	}
-+	IODelay(60);
-+
-+	/* 3. G3DCORE_CONFIGURATION (0x15862280) = 1, wait G3DCORE_STATUS (0x15862284) */
-+	exynos_mmio_rmw32(g_pmu_va, 0x2280, 0x1, 0x1);
-+	for (int i = 0; i < 50000; i++) {
-+		if (exynos_mmio_rd32(g_pmu_va, 0x2284) & 0x1) {
-+			break;
-+		}
-+		IODelay(1);
-+	}
-+
-+	/* 4. Conditional BG3D_PWRCTL_CTL2 write from g3dcore_on_evt1_1[] */
++	/* 5. Conditional BG3D_PWRCTL_CTL2 write from g3dcore_on_evt1_1[] */
 +	uint32_t ctl2_orig = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET);
 +	if ((ctl2_orig & (1U << 5)) == 0) {
 +		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x12);
@@ -738,7 +975,7 @@
 +	}
 +	exynos_mmio_rmw32(cmu_va, 0x0860, 0x1, 0x1);
 +
-+	/* 5. g3dcore_cmu_init[]: SPARE_CTRL atomic bit 7 -> wait bit 7 == 0 */
++	/* 6. g3dcore_cmu_init[]: SPARE_CTRL atomic bit 7 -> wait bit 7 == 0 */
 +	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3c14, 0x7);
 +	for (int i = 0; i < 50000; i++) {
 +		if ((exynos_mmio_rd32(g_pmu_va, 0x3c14) & (1U << 7)) == 0) {
@@ -770,9 +1007,13 @@
 +	if (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) {
 +		vm_offset_t sgpu_smn = ml_io_map(EXYNOS_SGPU_SMN_PA, 0x100000);
 +		if (sgpu_smn != 0) {
-+			g_sgpu_grbm_status = exynos_mmio_rd32(sgpu_smn, 0x8010);
++			g_sgpu_grbm_status = exynos_mmio_rd32(sgpu_smn, SGPU_MM_GRBM_STATUS);
++			uint64_t fw_a1 = 0;
++			uint64_t fw_rc = exynos_smc(SMC_CMD_SGPU_FW_BOOT, 0, 0, 0, &fw_a1);
++			uint32_t boot_stat = exynos_mmio_rd32(sgpu_smn, SGPU_MM_RLC_BOOTLOAD_STATUS);
 +			g_sgpu_powered = true;
-+			IOLog("SWEET GPU: Xclipse 920 awake! GRBM_STATUS=0x%08x\n", g_sgpu_grbm_status);
++			IOLog("SWEET GPU: Xclipse 920 awake! GRBM_STATUS=0x%08x FW_SMC=0x%llx BOOTLOAD=0x%08x\n",
++			    g_sgpu_grbm_status, fw_rc, boot_stat);
 +		}
 +	}
 +}
@@ -817,7 +1058,7 @@
  
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +819,7 @@
+@@ -192,7 +892,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -826,7 +1067,7 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +830,7 @@
+@@ -203,6 +903,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -834,7 +1075,7 @@
  	return true;
  }
  
-@@ -210,20 +838,14 @@
+@@ -210,20 +911,14 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -860,7 +1101,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -252,10 +874,30 @@
+@@ -252,10 +947,30 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -892,7 +1133,7 @@
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
  
-@@ -289,21 +931,14 @@
+@@ -289,21 +1004,14 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -917,7 +1158,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +946,12 @@
+@@ -311,15 +1019,12 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -934,7 +1175,7 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -349,6 +981,10 @@
+@@ -349,6 +1054,10 @@
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -945,7 +1186,7 @@
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -359,7 +995,6 @@
+@@ -359,7 +1068,6 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -953,7 +1194,7 @@
  		dx -= fOffX;
  		dy -= fOffY;
  		if (dx < 0) {
-@@ -384,21 +1019,42 @@
+@@ -384,21 +1092,42 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -1001,7 +1242,7 @@
  }
  
  bool
-@@ -534,7 +1190,7 @@
+@@ -534,7 +1263,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -1010,3 +1251,4 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
+
