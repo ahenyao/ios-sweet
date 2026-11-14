@@ -49,7 +49,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,23 +43,379 @@
+@@ -70,23 +43,450 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -75,9 +75,10 @@
 +
 +/*
 + * Exynos 2200 (s5e9925 / g0s) Display DMA (DPP0 / DECON0) & Xclipse 920 (sgpu)
-+ * Power Domain (pd_g3dcore) + TrustZone DTZPC SMC + BG3D_PWRCTL bring-up.
++ * Power Domain (pd_g3dcore) + PMU_ALIVE atomic bit-set + TrustZone DTZPC SMC.
 + */
 +#define EXYNOS_PMU_BASE_PA              0x15860000ULL
++#define EXYNOS_PMU_MAP_SIZE             0x10000ULL      /* 64KB required for (offset | 0xc000) atomic alias */
 +#define EXYNOS_G3D_SYSREG_PA            0x16c00000ULL
 +#define EXYNOS_CMU_G3D_QCH_PA           0x16c20000ULL
 +#define EXYNOS_CMU_G3D_PA               0x16c30000ULL
@@ -128,6 +129,19 @@
 +	exynos_mmio_wr32(base, off, (cur & ~mask) | (val & mask));
 +}
 +
++/*
++ * From drivers/soc/samsung/cal-if/pmucal/pmucal_rae.c:
++ * Atomic bit-set for PMU_ALIVE registers (offset 0~0x3fff) writes the bit index
++ * to base_va + (offset | 0xc000).
++ */
++static inline void
++exynos_pmu_set_bit_atomic(vm_offset_t pmu_base, uint32_t offset, uint32_t bit_idx)
++{
++	if (offset <= 0x3fff) {
++		exynos_mmio_wr32(pmu_base, offset | 0xc000U, bit_idx);
++	}
++}
++
 +static uint64_t
 +exynos_smc(uint64_t cmd, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t *out_a1)
 +{
@@ -176,7 +190,7 @@
 +}
 +
 +/*
-+ * Convert a row of 10-bit RGB10A2 ('w30r' = 0x77333072) pixels to 8-bit BGRA8888.
++ * Convert a row of 10-bit RGB10A2 ('w30r' = 0x77333072 or 'b3a8' = 0x62336138) to BGRA8888.
 + */
 +static inline void
 +sweet_fb_copy_w30r_row(uint32_t *dst, const uint32_t *src, uint32_t count)
@@ -328,8 +342,8 @@
 +}
 +
 +/*
-+ * Safe G3D bring-up called after UFS persistent logging (SWEET LOG) is active.
-+ * Do NOT write 0x3ef0 (V_PWREN) non-atomically, as that clears active PMIC rails.
++ * Exact s5e9925 g3dcore_on + exynos_pd_tz_restore + g3dcore_cmu_init sequence
++ * using pmucal_set_bit_atomic (offset | 0xc000).
 + */
 +static void
 +exynos_g3dcore_late_init(void)
@@ -340,12 +354,23 @@
 +		return;
 +	}
 +
-+	IOLog("SWEET GPU: starting late G3DCORE power-up (VGPIO_MON=0x%x)...\n",
-+	    exynos_mmio_rd32(g_pmu_va, 0x0a10));
++	uint32_t vgpio_before = exynos_mmio_rd32(g_pmu_va, 0x0a10);
++	IOLog("SWEET GPU: starting G3DCORE power-up (VGPIO_MON=0x%x V_PWREN=0x%x)...\n",
++	    vgpio_before, exynos_mmio_rd32(g_pmu_va, 0x3ef0));
 +
-+	/* 1. Enable G3DCORE_CONFIGURATION (0x15862280) = 1 and wait for G3DCORE_STATUS (0x15862284) */
-+	exynos_mmio_wr32(g_pmu_va, 0x2280, 0x1);
-+	for (int i = 0; i < 20000; i++) {
++	/* 1. PMUCAL_SET_BIT_ATOMIC("PMU_ALIVE/V_PWREN", 0x15860000, 0x3ef0, 0xa) */
++	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3ef0, 0xa);
++	for (int i = 0; i < 50000; i++) {
++		if (exynos_mmio_rd32(g_pmu_va, 0x0a10) & (1U << 7)) {
++			break;
++		}
++		IODelay(1);
++	}
++	IODelay(100);
++
++	/* 2. G3DCORE_CONFIGURATION (0x15862280) = 1, wait G3DCORE_STATUS (0x15862284) */
++	exynos_mmio_rmw32(g_pmu_va, 0x2280, 0x1, 0x1);
++	for (int i = 0; i < 50000; i++) {
 +		if (exynos_mmio_rd32(g_pmu_va, 0x2284) & 0x1) {
 +			break;
 +		}
@@ -353,31 +378,70 @@
 +	}
 +
 +	uint32_t g3d_stat = exynos_mmio_rd32(g_pmu_va, 0x2284);
-+	IOLog("SWEET GPU: G3DCORE_STATUS=0x%x after PMU enable\n", g3d_stat);
++	uint32_t vgpio_after = exynos_mmio_rd32(g_pmu_va, 0x0a10);
++	IOLog("SWEET GPU: G3DCORE_STATUS=0x%x VGPIO_MON=0x%x V_PWREN=0x%x\n",
++	    g3d_stat, vgpio_after, exynos_mmio_rd32(g_pmu_va, 0x3ef0));
 +	if ((g3d_stat & 0x1) == 0) {
 +		return;
 +	}
 +
-+	/* 2. Unlock TrustZone DTZPC for G3DCORE (need_smc = 0x16c10204) */
++	/* 3. Unlock TrustZone DTZPC for G3DCORE (need_smc = 0x16c10204) */
 +	uint64_t smc_a1 = 0;
 +	uint64_t smc_rc = exynos_smc(SMC_CMD_PREAPRE_PD_ONOFF,
 +	    EXYNOS_WAKEUP_PD_DOWN, G3DCORE_NEED_SMC_ID, RUNTIME_PM_TZPC_GROUP, &smc_a1);
 +	IOLog("SWEET GPU: DTZPC SMC(0x82000410) rc=0x%llx a1=0x%llx\n", smc_rc, smc_a1);
 +
-+	/* 3. Map and check BG3D_PWRCTL (0x16cd0000) */
 +	vm_offset_t pwrctl_va = ml_io_map(EXYNOS_BG3D_PWRCTL_PA, 0x1000);
 +	vm_offset_t cmu_va    = ml_io_map(EXYNOS_CMU_G3D_PA, 0x4000);
++	vm_offset_t dump_va   = ml_io_map(EXYNOS_G3D_DUMP_PA, 0x1000);
++	vm_offset_t strmux_va = ml_io_map(EXYNOS_G3D_STR_MUX_PA, 0x1000);
++	vm_offset_t sysreg_va = ml_io_map(EXYNOS_G3D_SYSREG_PA, 0x1000);
 +	if (pwrctl_va == 0 || cmu_va == 0) {
-+		IOLog("SWEET GPU: failed to map BG3D_PWRCTL / CMU_G3D\n");
 +		return;
 +	}
 +
++	/* 4. Conditional BG3D_PWRCTL_CTL2 write from g3dcore_on[] */
 +	uint32_t ctl2_orig = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET);
 +	uint32_t stat_orig = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
-+	IOLog("SWEET GPU: BG3D_PWRCTL initial CTL2=0x%x STATUS=0x%x\n", ctl2_orig, stat_orig);
-+
-+	exynos_mmio_wr32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x2a);
++	if ((ctl2_orig & (1U << 5)) == 0) {
++		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x12);
++	} else {
++		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x2a);
++	}
 +	uint32_t pwr_status = 0;
++	for (int i = 0; i < 50000; i++) {
++		pwr_status = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
++		if (pwr_status & (1U << 1)) {
++			break;
++		}
++		IODelay(1);
++	}
++
++	if (dump_va != 0) {
++		exynos_mmio_rmw32(dump_va, 0x0700, 0x1, 0x1);
++	}
++	if (strmux_va != 0) {
++		exynos_mmio_rmw32(strmux_va, 0x0000, 0x1, 0x1);
++	}
++	exynos_mmio_rmw32(cmu_va, 0x0860, 0x1, 0x1);
++
++	/* 5. g3dcore_cmu_init[]: SPARE_CTRL atomic bit 7 -> wait bit 7 == 0 */
++	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3c14, 0x7);
++	for (int i = 0; i < 50000; i++) {
++		if ((exynos_mmio_rd32(g_pmu_va, 0x3c14) & (1U << 7)) == 0) {
++			break;
++		}
++		IODelay(1);
++	}
++	if (dump_va != 0) {
++		exynos_mmio_rmw32(dump_va, 0x0700, 0x1, 0x1);
++	}
++	if (sysreg_va != 0) {
++		exynos_mmio_wr32(sysreg_va, 0x0008, 0x6);
++	}
++
++	/* 6. Assert GPUPWRREQ (0x28 / 0x2a) and check GPU_READY (bit 31) */
++	exynos_mmio_wr32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x28);
 +	for (int i = 0; i < 50000; i++) {
 +		pwr_status = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
 +		if (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) {
@@ -385,8 +449,13 @@
 +		}
 +		IODelay(1);
 +	}
-+	exynos_mmio_rmw32(cmu_va, 0x0860, 0x1, 0x1);
-+	IOLog("SWEET GPU: BG3D_PWRCTL after GPUPWRREQ STATUS=0x%08x\n", pwr_status);
++
++	IOLog("SWEET GPU: BG3D_PWRCTL orig(CTL2=0x%x STAT=0x%x) -> now(CTL2=0x%x STAT=0x%08x LOCK=0x%08x SPARE=0x%x)\n",
++	    ctl2_orig, stat_orig,
++	    exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET),
++	    pwr_status,
++	    exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_LOCK_OFFSET),
++	    exynos_mmio_rd32(g_pmu_va, 0x3c14));
 +
 +	if (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) {
 +		vm_offset_t sgpu_smn = ml_io_map(EXYNOS_SGPU_SMN_PA, 0x100000);
@@ -417,7 +486,8 @@
 +		    base_y8, shd_y8);
 +	}
 +
-+	g_pmu_va = ml_io_map(EXYNOS_PMU_BASE_PA, 0x4000);
++	/* Map full 64KB of PMU_ALIVE so (offset | 0xc000) atomic bit-set works */
++	g_pmu_va = ml_io_map(EXYNOS_PMU_BASE_PA, EXYNOS_PMU_MAP_SIZE);
 +	if (g_pmu_va != 0) {
 +		uint32_t dpuf_stat = exynos_mmio_rd32(g_pmu_va, 0x2100 + 0x04);
 +		uint32_t g3d_stat  = exynos_mmio_rd32(g_pmu_va, 0x2280 + 0x04);
@@ -425,7 +495,8 @@
 +		    dpuf_stat, g3d_stat);
 +	}
 +
-+	if (provider != NULL) {
++	/* Only register IOAcceleratorES stub when sweetgpu=3 to avoid backboardd match log spam */
++	if (gpu_mode >= 3 && provider != NULL) {
 +		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
 +		if (accel != NULL) {
 +			if (!accel->init() || !accel->attach(provider) || !accel->start(provider)) {
@@ -437,7 +508,7 @@
  
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +521,7 @@
+@@ -192,7 +592,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -446,7 +517,7 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +532,7 @@
+@@ -203,6 +603,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -454,28 +525,65 @@
  	return true;
  }
  
-@@ -218,6 +548,11 @@
- 		0, 0,
- 	};
- 
+@@ -210,20 +611,14 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+-	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+-	uint64_t values[6] = {
+-		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
+-	};
++
 +	if (count == 300 && !g_sgpu_init_attempted) {
 +		g_sgpu_init_attempted = true;
 +		exynos_g3dcore_late_init();
 +	}
-+
+ 
  	IOLockLock(fb->fLock);
- 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
- 		IOMobileFramebufferUserClient *client =
-@@ -252,7 +587,7 @@
+-	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+-		IOMobileFramebufferUserClient *client =
+-		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+-		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+-	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -252,10 +647,30 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
 -	if ((count % 30) == 0) { uint32_t hbv = ((count / 30) & 1) ? 0xffffffff : 0xff00ff00; for (uint32_t hy = 0; hy < 120; hy++) { volatile uint32_t *hbr = (volatile uint32_t *)(fb->fPixels + (uint64_t)hy * fb->fRowBytes); for (uint32_t hx = 0; hx < 120; hx++) { hbr[hx] = hbv; } } } if (rec != NULL) {
++
++	/*
++	 * Present the pending swap BEFORE notifying clients of VSync, so backboardd
++	 * does not overwrite the backbuffer IOSurface mid-copy (prevents diagonal tearing).
++	 */
 +	if (rec != NULL) {
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
-@@ -289,21 +624,14 @@
++
++	uint64_t now = mach_absolute_time();
++	uint64_t values[6] = {
++		(uint32_t)count, (uint32_t)(count >> 32),
++		(uint32_t)now, (uint32_t)(now >> 32),
++		0, 0,
++	};
++	IOLockLock(fb->fLock);
++	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client =
++		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
++		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
++	}
++	IOLockUnlock(fb->fLock);
++
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+@@ -289,21 +704,14 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -500,7 +608,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +639,12 @@
+@@ -311,15 +719,12 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -517,7 +625,7 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -349,6 +674,10 @@
+@@ -349,6 +754,10 @@
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -528,7 +636,7 @@
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -359,7 +688,6 @@
+@@ -359,7 +768,6 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -536,7 +644,7 @@
  		dx -= fOffX;
  		dy -= fOffY;
  		if (dx < 0) {
-@@ -384,17 +712,30 @@
+@@ -384,21 +792,35 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -552,7 +660,7 @@
 -				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
 -				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
 -				    (size_t)w * 4);
-+			if (s->pixelFormat == SWEET_FB_FORMAT_W30R) {
++			if (s->pixelFormat == SWEET_FB_FORMAT_W30R || s->pixelFormat == SWEET_FB_FORMAT_B3A8) {
 +				for (int32_t y = 0; y < h; y++) {
 +					sweet_fb_copy_w30r_row(
 +					    (uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
@@ -572,7 +680,12 @@
  			}
  		}
  		s->release();
-@@ -534,7 +875,7 @@
+ 	}
++	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+ bool
+@@ -534,7 +956,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -581,4 +694,3 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
-
