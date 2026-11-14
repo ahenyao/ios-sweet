@@ -49,7 +49,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,23 +43,450 @@
+@@ -70,17 +43,11 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -69,16 +69,16 @@
  
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
- };
+@@ -88,6 +55,366 @@
  
  OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
-+
+ 
 +/*
 + * Exynos 2200 (s5e9925 / g0s) Display DMA (DPP0 / DECON0) & Xclipse 920 (sgpu)
 + * Power Domain (pd_g3dcore) + PMU_ALIVE atomic bit-set + TrustZone DTZPC SMC.
 + */
 +#define EXYNOS_PMU_BASE_PA              0x15860000ULL
-+#define EXYNOS_PMU_MAP_SIZE             0x10000ULL      /* 64KB required for (offset | 0xc000) atomic alias */
++#define EXYNOS_PMU_MAP_SIZE             0x10000ULL
 +#define EXYNOS_G3D_SYSREG_PA            0x16c00000ULL
 +#define EXYNOS_CMU_G3D_QCH_PA           0x16c20000ULL
 +#define EXYNOS_CMU_G3D_PA               0x16c30000ULL
@@ -129,11 +129,6 @@
 +	exynos_mmio_wr32(base, off, (cur & ~mask) | (val & mask));
 +}
 +
-+/*
-+ * From drivers/soc/samsung/cal-if/pmucal/pmucal_rae.c:
-+ * Atomic bit-set for PMU_ALIVE registers (offset 0~0x3fff) writes the bit index
-+ * to base_va + (offset | 0xc000).
-+ */
 +static inline void
 +exynos_pmu_set_bit_atomic(vm_offset_t pmu_base, uint32_t offset, uint32_t bit_idx)
 +{
@@ -163,9 +158,6 @@
 +	return x0;
 +}
 +
-+/*
-+ * Fast 64-byte write-combining burst copy for Normal-NC / Write-Combine memory.
-+ */
 +static inline void
 +sweet_fb_fast_copy(void *dst, const void *src, size_t nbytes)
 +{
@@ -189,9 +181,6 @@
 +	}
 +}
 +
-+/*
-+ * Convert a row of 10-bit RGB10A2 ('w30r' = 0x77333072 or 'b3a8' = 0x62336138) to BGRA8888.
-+ */
 +static inline void
 +sweet_fb_copy_w30r_row(uint32_t *dst, const uint32_t *src, uint32_t count)
 +{
@@ -204,15 +193,15 @@
 +	}
 +}
 +
-+class IOAcceleratorES : public IOService {
-+	OSDeclareDefaultStructors(IOAcceleratorES);
++class AGXAccelerator : public IOService {
++	OSDeclareDefaultStructors(AGXAccelerator);
 +public:
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
 +	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 +};
 +
-+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++OSDefineMetaClassAndStructors(AGXAccelerator, IOService);
 +
 +class SweetAcceleratorUserClient : public IOUserClient {
 +	OSDeclareDefaultStructors(SweetAcceleratorUserClient);
@@ -232,24 +221,25 @@
 +OSDefineMetaClassAndStructors(SweetAcceleratorUserClient, IOUserClient);
 +
 +bool
-+IOAcceleratorES::start(IOService *provider)
++AGXAccelerator::start(IOService *provider)
 +{
 +	if (!IOService::start(provider)) {
 +		return false;
 +	}
-+	setName("IOAcceleratorES");
++	setName("AGXAccelerator");
 +	setProperty(kIOUserClientClassKey, "SweetAcceleratorUserClient");
-+	setProperty("IOClass", "IOAcceleratorES");
-+	setProperty("IOMatchCategory", "IOAcceleratorES");
++	setProperty("IOClass", "AGXAccelerator");
++	setProperty("IOMatchCategory", "AGXAccelerator");
 +	setProperty("MetalPluginName", "AGXMetalA11");
 +	setProperty("MetalPluginClassName", "AGXPrincipalDevice");
++	setProperty("IOGVACDXModel", 1070U);
 +	registerService();
-+	IOLog("SWEET GPU: IOAcceleratorES service registered\n");
++	IOLog("SWEET GPU: AGXAccelerator service registered for Metal acceleration\n");
 +	return true;
 +}
 +
 +IOReturn
-+IOAcceleratorES::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
 +    __unused OSDictionary *properties, IOUserClient **handler)
 +{
 +	SweetAcceleratorUserClient *client = OSTypeAlloc(SweetAcceleratorUserClient);
@@ -279,9 +269,6 @@
 +	if (fSharedMem != NULL) {
 +		bzero(fSharedMem->getBytesNoCopy(), page_size);
 +	}
-+	char name[32];
-+	proc_selfname(name, sizeof(name));
-+	IOLog("SWEET GPU: %s opened IOAcceleratorES user client (type %u)\n", name, (uint32_t)type);
 +	return true;
 +}
 +
@@ -303,9 +290,6 @@
 +SweetAcceleratorUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 +    IOMemoryDescriptor **memory)
 +{
-+	char name[32];
-+	proc_selfname(name, sizeof(name));
-+	IOLog("SWEET GPU: %s clientMemoryForType(%u)\n", name, (uint32_t)type);
 +	if (fSharedMem == NULL) {
 +		return kIOReturnNoMemory;
 +	}
@@ -315,23 +299,10 @@
 +	return kIOReturnSuccess;
 +}
 +
-+static uint64_t sweet_gpu_sel_logged;
-+
 +IOReturn
 +SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
 +{
-+	if (selector >= 64 || !(sweet_gpu_sel_logged & (1ULL << selector))) {
-+		if (selector < 64) {
-+			sweet_gpu_sel_logged |= 1ULL << selector;
-+		}
-+		char name[32];
-+		proc_selfname(name, sizeof(name));
-+		IOLog("SWEET GPU: %s type %u sel %u in %u/%u out %u/%u\n",
-+		    name, (uint32_t)fType, selector,
-+		    args->scalarInputCount, args->structureInputSize,
-+		    args->scalarOutputCount, args->structureOutputSize);
-+	}
 +	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
 +		args->scalarOutput[i] = 0;
 +	}
@@ -341,10 +312,6 @@
 +	return kIOReturnSuccess;
 +}
 +
-+/*
-+ * Exact s5e9925 g3dcore_on + exynos_pd_tz_restore + g3dcore_cmu_init sequence
-+ * using pmucal_set_bit_atomic (offset | 0xc000).
-+ */
 +static void
 +exynos_g3dcore_late_init(void)
 +{
@@ -354,11 +321,6 @@
 +		return;
 +	}
 +
-+	uint32_t vgpio_before = exynos_mmio_rd32(g_pmu_va, 0x0a10);
-+	IOLog("SWEET GPU: starting G3DCORE power-up (VGPIO_MON=0x%x V_PWREN=0x%x)...\n",
-+	    vgpio_before, exynos_mmio_rd32(g_pmu_va, 0x3ef0));
-+
-+	/* 1. PMUCAL_SET_BIT_ATOMIC("PMU_ALIVE/V_PWREN", 0x15860000, 0x3ef0, 0xa) */
 +	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3ef0, 0xa);
 +	for (int i = 0; i < 50000; i++) {
 +		if (exynos_mmio_rd32(g_pmu_va, 0x0a10) & (1U << 7)) {
@@ -368,7 +330,6 @@
 +	}
 +	IODelay(100);
 +
-+	/* 2. G3DCORE_CONFIGURATION (0x15862280) = 1, wait G3DCORE_STATUS (0x15862284) */
 +	exynos_mmio_rmw32(g_pmu_va, 0x2280, 0x1, 0x1);
 +	for (int i = 0; i < 50000; i++) {
 +		if (exynos_mmio_rd32(g_pmu_va, 0x2284) & 0x1) {
@@ -378,18 +339,13 @@
 +	}
 +
 +	uint32_t g3d_stat = exynos_mmio_rd32(g_pmu_va, 0x2284);
-+	uint32_t vgpio_after = exynos_mmio_rd32(g_pmu_va, 0x0a10);
-+	IOLog("SWEET GPU: G3DCORE_STATUS=0x%x VGPIO_MON=0x%x V_PWREN=0x%x\n",
-+	    g3d_stat, vgpio_after, exynos_mmio_rd32(g_pmu_va, 0x3ef0));
 +	if ((g3d_stat & 0x1) == 0) {
 +		return;
 +	}
 +
-+	/* 3. Unlock TrustZone DTZPC for G3DCORE (need_smc = 0x16c10204) */
 +	uint64_t smc_a1 = 0;
-+	uint64_t smc_rc = exynos_smc(SMC_CMD_PREAPRE_PD_ONOFF,
-+	    EXYNOS_WAKEUP_PD_DOWN, G3DCORE_NEED_SMC_ID, RUNTIME_PM_TZPC_GROUP, &smc_a1);
-+	IOLog("SWEET GPU: DTZPC SMC(0x82000410) rc=0x%llx a1=0x%llx\n", smc_rc, smc_a1);
++	exynos_smc(SMC_CMD_PREAPRE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN,
++	    G3DCORE_NEED_SMC_ID, RUNTIME_PM_TZPC_GROUP, &smc_a1);
 +
 +	vm_offset_t pwrctl_va = ml_io_map(EXYNOS_BG3D_PWRCTL_PA, 0x1000);
 +	vm_offset_t cmu_va    = ml_io_map(EXYNOS_CMU_G3D_PA, 0x4000);
@@ -400,21 +356,11 @@
 +		return;
 +	}
 +
-+	/* 4. Conditional BG3D_PWRCTL_CTL2 write from g3dcore_on[] */
 +	uint32_t ctl2_orig = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET);
-+	uint32_t stat_orig = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
 +	if ((ctl2_orig & (1U << 5)) == 0) {
 +		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x12);
 +	} else {
 +		exynos_mmio_rmw32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x3f, 0x2a);
-+	}
-+	uint32_t pwr_status = 0;
-+	for (int i = 0; i < 50000; i++) {
-+		pwr_status = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
-+		if (pwr_status & (1U << 1)) {
-+			break;
-+		}
-+		IODelay(1);
 +	}
 +
 +	if (dump_va != 0) {
@@ -425,7 +371,6 @@
 +	}
 +	exynos_mmio_rmw32(cmu_va, 0x0860, 0x1, 0x1);
 +
-+	/* 5. g3dcore_cmu_init[]: SPARE_CTRL atomic bit 7 -> wait bit 7 == 0 */
 +	exynos_pmu_set_bit_atomic(g_pmu_va, 0x3c14, 0x7);
 +	for (int i = 0; i < 50000; i++) {
 +		if ((exynos_mmio_rd32(g_pmu_va, 0x3c14) & (1U << 7)) == 0) {
@@ -440,8 +385,9 @@
 +		exynos_mmio_wr32(sysreg_va, 0x0008, 0x6);
 +	}
 +
-+	/* 6. Assert GPUPWRREQ (0x28 / 0x2a) and check GPU_READY (bit 31) */
-+	exynos_mmio_wr32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x28);
++	/* FIXED: Assert 0x2a to keep GPUPWRREQ (bit 1) and COLDVSGFXOFF asserted simultaneously */
++	exynos_mmio_wr32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET, 0x2a);
++	uint32_t pwr_status = 0;
 +	for (int i = 0; i < 50000; i++) {
 +		pwr_status = exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_STATUS_OFFSET);
 +		if (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) {
@@ -450,12 +396,8 @@
 +		IODelay(1);
 +	}
 +
-+	IOLog("SWEET GPU: BG3D_PWRCTL orig(CTL2=0x%x STAT=0x%x) -> now(CTL2=0x%x STAT=0x%08x LOCK=0x%08x SPARE=0x%x)\n",
-+	    ctl2_orig, stat_orig,
-+	    exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_CTL2_OFFSET),
-+	    pwr_status,
-+	    exynos_mmio_rd32(pwrctl_va, BG3D_PWRCTL_LOCK_OFFSET),
-+	    exynos_mmio_rd32(g_pmu_va, 0x3c14));
++	IOLog("SWEET GPU: BG3D_PWRCTL final STATUS=0x%08x READY=%u\n",
++	    pwr_status, (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) ? 1 : 0);
 +
 +	if (pwr_status & BG3D_PWRCTL_STATUS_GPU_READY) {
 +		vm_offset_t sgpu_smn = ml_io_map(EXYNOS_SGPU_SMN_PA, 0x100000);
@@ -473,31 +415,16 @@
 +	int gpu_mode = 1;
 +	PE_parse_boot_argn("sweetgpu", &gpu_mode, sizeof(gpu_mode));
 +	if (gpu_mode == 0) {
-+		IOLog("SWEET GPU: disabled via sweetgpu=0\n");
 +		return;
 +	}
 +
 +	g_dpp0_dma_va = ml_io_map(EXYNOS_DPP0_DMA_PA, 0x1000);
 +	g_decon0_va   = ml_io_map(EXYNOS_DECON0_MAIN_PA, 0x1000);
-+	if (g_dpp0_dma_va != 0) {
-+		uint32_t base_y8 = exynos_mmio_rd32(g_dpp0_dma_va, 0x040);
-+		uint32_t shd_y8  = exynos_mmio_rd32(g_dpp0_dma_va, 0x440);
-+		IOLog("SWEET GPU: DPP0_DMA ready: IDMA_BASE=0x%08x SHADOW=0x%08x\n",
-+		    base_y8, shd_y8);
-+	}
 +
-+	/* Map full 64KB of PMU_ALIVE so (offset | 0xc000) atomic bit-set works */
 +	g_pmu_va = ml_io_map(EXYNOS_PMU_BASE_PA, EXYNOS_PMU_MAP_SIZE);
-+	if (g_pmu_va != 0) {
-+		uint32_t dpuf_stat = exynos_mmio_rd32(g_pmu_va, 0x2100 + 0x04);
-+		uint32_t g3d_stat  = exynos_mmio_rd32(g_pmu_va, 0x2280 + 0x04);
-+		IOLog("SWEET GPU: PMU stat: pd_dpuf=0x%x pd_g3dcore=0x%x\n",
-+		    dpuf_stat, g3d_stat);
-+	}
 +
-+	/* Only register IOAcceleratorES stub when sweetgpu=3 to avoid backboardd match log spam */
-+	if (gpu_mode >= 3 && provider != NULL) {
-+		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
++	if (provider != NULL) {
++		AGXAccelerator *accel = OSTypeAlloc(AGXAccelerator);
 +		if (accel != NULL) {
 +			if (!accel->init() || !accel->attach(provider) || !accel->start(provider)) {
 +				accel->release();
@@ -505,11 +432,61 @@
 +		}
 +	}
 +}
- 
++
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +592,7 @@
- 		IOLog("SWEET FB: no vsync timer\n");
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -102,20 +429,20 @@
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+-	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+-	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+-	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	uint32_t      fLogicalW, fLogicalH;
++	int32_t       fOffX, fOffY;
++	uintptr_t     fPixels;
+ 	IOMemoryMap  *fMap;
+-	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+-	IOLock       *fLock;            /* swaps and client list */
++	SweetSurface *fSurface;
++	IOLock       *fLock;
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];
+ 	bool          fDirty;
+-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+-	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint32_t      fFlushTicks;
++	bool          fPowerOff;
++	uint32_t      fFadeStep;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -163,7 +490,6 @@
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+-		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+ 	int native = 1;
+@@ -182,17 +508,15 @@
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+-		IOLog("SWEET FB: setup failed\n");
+-		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
++		OSSafeReleaseNULL(fSurface);
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+-		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
 -	uint32_t hz = 10;
@@ -517,15 +494,17 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +603,7 @@
+@@ -201,8 +525,7 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
- 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
- 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
 +	exynos_gpu_probe(provider);
  	return true;
  }
  
-@@ -210,20 +611,14 @@
+@@ -210,22 +533,15 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -549,18 +528,16 @@
 -		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
 -	}
  	if (fb->fPowerOff) {
- 		/* Fade out: halve every channel each vsync, then black, then idle. */
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -252,10 +647,30 @@
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+@@ -252,10 +568,26 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
 -	if ((count % 30) == 0) { uint32_t hbv = ((count / 30) & 1) ? 0xffffffff : 0xff00ff00; for (uint32_t hy = 0; hy < 120; hy++) { volatile uint32_t *hbr = (volatile uint32_t *)(fb->fPixels + (uint64_t)hy * fb->fRowBytes); for (uint32_t hx = 0; hx < 120; hx++) { hbr[hx] = hbv; } } } if (rec != NULL) {
 +
-+	/*
-+	 * Present the pending swap BEFORE notifying clients of VSync, so backboardd
-+	 * does not overwrite the backbuffer IOSurface mid-copy (prevents diagonal tearing).
-+	 */
 +	if (rec != NULL) {
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
@@ -583,10 +560,13 @@
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
  
-@@ -289,21 +704,14 @@
- static uint32_t sweet_fb_swaps_logged;
- static uint64_t sweet_fb_swap_count;
+@@ -286,40 +618,24 @@
+ 	return v;
+ }
  
+-static uint32_t sweet_fb_swaps_logged;
+-static uint64_t sweet_fb_swap_count;
+-
 -/* Copy each enabled layer's surface into the panel memory (no scaling). */
 -/*
 - * A swap only records the frame: copying 10 MB into the panel on every
@@ -604,11 +584,10 @@
 +	fDirty = true;
  	IOLockUnlock(fLock);
 -	if ((++sweet_fb_swap_count % 20) == 0) {
-+	if ((++sweet_fb_swap_count % 300) == 0) {
- 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
- 	}
+-		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+-	}
  }
-@@ -311,15 +719,12 @@
+ 
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -625,7 +604,20 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -349,6 +754,10 @@
+@@ -336,19 +652,16 @@
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
+-		if (sweet_fb_swaps_logged < 16) {
+-			sweet_fb_swaps_logged++;
+-			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+-			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+-			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+-			    get32(a, 12), dx, dy, w, h);
+-		}
+ 		if (s == NULL || s == fSurface) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -636,7 +628,7 @@
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -359,7 +768,6 @@
+@@ -359,7 +672,6 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -644,7 +636,7 @@
  		dx -= fOffX;
  		dy -= fOffY;
  		if (dx < 0) {
-@@ -384,21 +792,35 @@
+@@ -384,21 +696,35 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -685,7 +677,32 @@
  }
  
  bool
-@@ -534,7 +956,7 @@
+@@ -454,7 +780,6 @@
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Called with the framebuffer lock held. */
+ void
+ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uint32_t count)
+ {
+@@ -468,8 +793,6 @@
+ 	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+ 	    kIOUserNotifyOptionCanDrop);
+ }
+-
+-static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -526,23 +849,18 @@
+ 			fFunc[type] = args->scalarInput[0];
+ 			fRefcon[type] = args->scalarInput[1];
+ 			IOLockUnlock(fFB->fLock);
+-			char name[32];
+-			proc_selfname(name, sizeof(name));
+-			IOLog("SWEET FB: %s notifications type %u %s\n", name, type,
+-			    args->scalarInput[0] ? "on" : "off");
+ 		}
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -694,3 +711,29 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
++				fFB->fDirty = true;
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
+@@ -556,16 +874,6 @@
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+-		if (selector < 64) {
+-			sweet_fb_logged |= 1ULL << selector;
+-		}
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarOutputCount, args->structureOutputSize, ret);
+-	}
+ 	return ret;
+ }
+ #endif /* SWEET */
