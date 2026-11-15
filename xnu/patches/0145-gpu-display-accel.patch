@@ -322,7 +322,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,23 +44,842 @@
+@@ -70,23 +44,868 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -622,8 +622,9 @@
 +	fNotifyPort = MACH_PORT_NULL;
 +	fLock = IOLockAlloc();
 +
-+	fStatusMem = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	/* Allocate the status memory with kIOMemoryShared so XNU natively maps it RW in the user task */
++	fStatusMem = IOBufferMemoryDescriptor::withOptions(
++	    kIODirectionInOut | kIOMemoryShared, page_size, page_size);
 +	if (fStatusMem != NULL) {
 +		bzero(fStatusMem->getBytesNoCopy(), page_size);
 +		fStatusMap = fStatusMem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapDefaultCache);
@@ -718,8 +719,9 @@
 +	if (sz > (64U << 20)) {
 +		sz = (64U << 20);
 +	}
-+	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, sz, page_size);
++	/* Use kIOMemoryShared so the user task maps it RW (PROT_READ|PROT_WRITE) */
++	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::withOptions(
++	    kIODirectionInOut | kIOMemoryShared, sz, page_size);
 +	if (desc == NULL) {
 +		return 0;
 +	}
@@ -861,9 +863,11 @@
 +		uint64_t texAddr = 0;
 +		uint64_t origAddr = 0;
 +		uint32_t primarySid = 0;
++		uint32_t options = 0;
 +		if (args->structureInput != NULL && args->structureInputSize >= 0x50) {
 +			const uint8_t *in = (const uint8_t *)args->structureInput;
 +			uint64_t inSz = 0;
++			memcpy(&options, in, 4);
 +			memcpy(&pinnedGpuVA, in + 0x30, 8);
 +			memcpy(&texAddr, in + 0x38, 8);
 +			memcpy(&origAddr, in + 0x40, 8);
@@ -879,7 +883,9 @@
 +		uint64_t gpuVA = 0;
 +		uint32_t actualSz = reqSz;
 +		uint32_t sid = 0;
-+		if (texAddr != 0) {
++
++		/* Only use texAddr as a mapped memory pointer if the client passed bit 7 */
++		if (texAddr != 0 && (options & 0x80)) {
 +			sid = ++fNextId;
 +			va = texAddr;
 +			uint64_t bufferOffset = (origAddr != 0 && texAddr >= origAddr) ? (texAddr - origAddr) : 0;
@@ -898,17 +904,29 @@
 +		}
 +		
 +		uint64_t len64 = actualSz;
-+		uint64_t memEntry = 0;
++		uint64_t memEntry = fStatusMap != NULL ? fStatusMap->getAddress() : va;
 +		uint32_t flags = 0;
 +		uint64_t traceId = sid;
 +		
++		/* 
++		 * Exact structure layout verified in IOGPU.dylib!
++		 * +0x00: gpuVA -> resource._res.gpuVirtualAddress
++		 * +0x08: cpuVA -> resource._res.virtualAddress (via IOGPUResourceGetDataBytes)
++		 * +0x10: len64 -> size
++		 * +0x18: flags -> resource._res.flags (must keep bits 0 and 7 clear so cpuVA is mapped!)
++		 * +0x1c: sid   -> resource.resourceID
++		 * +0x20: sharedVA -> MUST be non-zero (so GetClientShared succeeds)
++		 * +0x28: residentDataSize -> used to calculate allocatedSize!
++		 * +0x48: traceId -> trace object ID
++		 */
 +		memcpy(tmpOut + 0x00, &gpuVA, 8);
 +		memcpy(tmpOut + 0x08, &va, 8);
 +		memcpy(tmpOut + 0x10, &len64, 8);
-+		memcpy(tmpOut + 0x18, &sid, 4);
-+		memcpy(tmpOut + 0x1c, &flags, 4);
++		memcpy(tmpOut + 0x18, &flags, 4);
++		memcpy(tmpOut + 0x1c, &sid, 4);
 +		memcpy(tmpOut + 0x20, &memEntry, 8);
-+		memcpy(tmpOut + 0x28, &traceId, 8);
++		memcpy(tmpOut + 0x28, &len64, 8);
++		memcpy(tmpOut + 0x48, &traceId, 8);
 +		break;
 +	}
 +	case 10: { /* _IOGPUResourceRelease */
@@ -977,7 +995,7 @@
 +		}
 +		break;
 +	}
-+	case 256: { /* 0x100: AGXGPUCoreConfig (out 0x78 = 120 bytes into x20 + 0x268) */
++	case 256: { /* 0x100: AGXGPUCoreConfig (out 0x78 = 120 bytes) */
 +		uint32_t numCores = 3;
 +		uint32_t coreMask = 0x7;
 +		uint32_t rev      = 0x30008; /* G10P */
@@ -988,6 +1006,14 @@
 +		memcpy(tmpOut + 0x0c, &sub, 4);
 +		memcpy(tmpOut + 0x10, &numCores, 4);
 +		memcpy(tmpOut + 0x14, &sub, 4);
++		
++		/* 
++		 * Prevent integer underflow inside AGXMetalA11 beginRenderPass by populating the maximum allocation sizes!
++		 */
++		uint64_t safeLimit = 0x40000000ULL; /* 1 GB */
++		for (int i = 0; i < 12; i++) {
++			memcpy(tmpOut + 0x18 + (i * 8), &safeLimit, 8);
++		}
 +		break;
 +	}
 +	case 258: { /* 0x102: checkDeviceConnectionSanity (out 0x1c8 = 456 bytes) */
@@ -1173,7 +1199,7 @@
  
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +985,7 @@
+@@ -192,7 +1011,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -1182,7 +1208,7 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +996,7 @@
+@@ -203,6 +1022,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -1190,7 +1216,7 @@
  	return true;
  }
  
-@@ -210,20 +1004,14 @@
+@@ -210,20 +1030,14 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -1216,7 +1242,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -252,10 +1040,30 @@
+@@ -252,10 +1066,30 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -1248,7 +1274,7 @@
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
  
-@@ -289,21 +1097,14 @@
+@@ -289,21 +1123,14 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -1273,7 +1299,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +1112,12 @@
+@@ -311,15 +1138,12 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -1290,7 +1316,7 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -349,6 +1147,10 @@
+@@ -349,6 +1173,10 @@
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -1301,7 +1327,7 @@
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -359,7 +1161,6 @@
+@@ -359,7 +1187,6 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -1309,7 +1335,7 @@
  		dx -= fOffX;
  		dy -= fOffY;
  		if (dx < 0) {
-@@ -384,21 +1185,42 @@
+@@ -384,21 +1211,42 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -1357,7 +1383,7 @@
  }
  
  bool
-@@ -534,7 +1356,7 @@
+@@ -534,7 +1382,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -1366,3 +1392,4 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
+
