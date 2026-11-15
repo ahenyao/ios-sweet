@@ -87,7 +87,29 @@
  			return true;
  		}
  	}
-@@ -393,6 +400,13 @@
+@@ -345,6 +352,21 @@
+ 		return kIOReturnNoMemory;
+ 	}
+ 	s->allocSize = (uint32_t)alloc;
++
++	/*
++	 * Normalize 2-plane AGX lossless-compressed 'b3a8' (0x62336138) surfaces to
++	 * single-plane 'BGRA' (0x42475241) while keeping allocSize intact so both
++	 * CoreGraphics/PaperBoardUI and CA::OGL::SWContext/MetalContext can render
++	 * and composite wallpaper & blur backdrops without AGX hardware compression.
++	 */
++	if (s->pixelFormat == 0x62336138 && s->bytesPerElement == 4) {
++		if (s->planeCount > 0 && s->planes[0].bytesPerRow >= s->width * 4) {
++			s->bytesPerRow = s->planes[0].bytesPerRow;
++			s->offset = s->planes[0].offset;
++		}
++		s->pixelFormat = 0x42475241;
++		s->planeCount = 0;
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -393,6 +415,13 @@
  		return false;
  	}
  	sweet_surface_init_lock();
@@ -101,7 +123,7 @@
  	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
  	registerService();
  	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
-@@ -402,9 +416,10 @@
+@@ -402,9 +431,10 @@
  class IOSurfaceRootUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOSurfaceRootUserClient);
  
@@ -115,7 +137,7 @@
  
  	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
  	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
-@@ -452,12 +467,14 @@
+@@ -452,12 +482,14 @@
  	fTask = owningTask;
  	fLock = IOLockAlloc();
  	fRefs = OSArray::withCapacity(16);
@@ -130,7 +152,7 @@
  	OSSafeReleaseNULL(fRefs);
  	if (fLock != NULL) {
  		IOLockFree(fLock);
-@@ -471,6 +488,7 @@
+@@ -471,6 +503,7 @@
  {
  	IOLockLock(fLock);
  	fRefs->flushCollection();
@@ -138,7 +160,7 @@
  	IOLockUnlock(fLock);
  	terminate();
  	return kIOReturnSuccess;
-@@ -495,13 +513,6 @@
+@@ -495,13 +528,6 @@
  /*
   * Count one more create/lookup of s by this client, mapping it into the
   * task the first time. Takes over the caller's user count on s.
@@ -152,7 +174,7 @@
   */
  IOReturn
  IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing)
-@@ -536,7 +547,6 @@
+@@ -536,7 +562,6 @@
  	IOLockLock(fLock);
  	SweetSurfaceRef *raced = findRef(s->id, NULL);
  	if (raced != NULL && raced->surface == s) {
@@ -160,7 +182,7 @@
  		raced->count++;
  		IOLockUnlock(fLock);
  		ref->release();
-@@ -640,7 +650,6 @@
+@@ -640,7 +665,6 @@
  		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
  	}
  	if (ret != kIOReturnSuccess && !existing) {
@@ -168,7 +190,7 @@
  		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
  	}
  	return ret;
-@@ -749,6 +758,65 @@
+@@ -749,6 +773,65 @@
  		sweet_surf_log_once("sel", selector);
  		return ret;
  	}
@@ -234,7 +256,7 @@
  	case kSweetSurfaceLookupFromPort: {
  		OSObject *obj = NULL;
  		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
-@@ -773,7 +841,6 @@
+@@ -773,7 +856,6 @@
  		return kIOReturnSuccess;
  	}
  	default:
@@ -300,7 +322,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,23 +44,785 @@
+@@ -70,23 +44,828 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -507,7 +529,7 @@
 +	uint32_t                  fNextId;
 +	mach_port_t               fNotifyPort;
 +
-+	uint32_t allocShmem(uint32_t size, uint64_t *outVA, uint32_t *outSize);
++	uint32_t allocShmem(uint32_t size, uint64_t *outVA, uint32_t *outSize, void **outKernelPtr);
 +	void freeShmem(uint32_t id);
 +public:
 +	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
@@ -541,8 +563,17 @@
 +	return true;
 +}
 +
-+static int g_backboardd_first_pid;
-+static int g_springboard_first_pid;
++struct sweet_gpu_proc_guard {
++	const char *name;
++	int         first_pid;
++};
++
++static struct sweet_gpu_proc_guard g_gpu_guards[] = {
++	{ "backboardd",  0 },
++	{ "SpringBoard", 0 },
++	{ "chronod",     0 },
++	{ "PosterBoard", 0 },
++};
 +
 +IOReturn
 +AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
@@ -553,25 +584,20 @@
 +	int pid = proc_selfpid();
 +
 +	/*
-+	 * Safety net: if backboardd or SpringBoard opened AGXAccelerator in a
-+	 * previous PID and crashed, fall back to CoreAnimation's SW renderer on
-+	 * respawn so the phone always boots into the UI instead of looping.
++	 * Safety net: if a critical UI daemon opened AGXAccelerator in an earlier
++	 * PID and crashed, fall back to CoreAnimation's SW renderer on respawn so
++	 * the phone never crash-loops.
 +	 */
-+	if (strcmp(name, "backboardd") == 0) {
-+		if (g_backboardd_first_pid == 0) {
-+			g_backboardd_first_pid = pid;
-+		} else if (g_backboardd_first_pid != pid) {
-+			IOLog("SWEET GPU: backboardd[%d] respawned after PID %d; falling back to SW renderer\n",
-+			    pid, g_backboardd_first_pid);
-+			return kIOReturnUnsupported;
-+		}
-+	} else if (strcmp(name, "SpringBoard") == 0) {
-+		if (g_springboard_first_pid == 0) {
-+			g_springboard_first_pid = pid;
-+		} else if (g_springboard_first_pid != pid) {
-+			IOLog("SWEET GPU: SpringBoard[%d] respawned after PID %d; falling back to SW renderer\n",
-+			    pid, g_springboard_first_pid);
-+			return kIOReturnUnsupported;
++	for (size_t i = 0; i < sizeof(g_gpu_guards) / sizeof(g_gpu_guards[0]); i++) {
++		if (strcmp(name, g_gpu_guards[i].name) == 0) {
++			if (g_gpu_guards[i].first_pid == 0) {
++				g_gpu_guards[i].first_pid = pid;
++			} else if (g_gpu_guards[i].first_pid != pid) {
++				IOLog("SWEET GPU: %s[%d] respawned after PID %d; falling back to SW renderer\n",
++				    name, pid, g_gpu_guards[i].first_pid);
++				return kIOReturnUnsupported;
++			}
++			break;
 +		}
 +	}
 +
@@ -676,7 +702,7 @@
 +}
 +
 +uint32_t
-+SweetAcceleratorUserClient::allocShmem(uint32_t reqSize, uint64_t *outVA, uint32_t *outSize)
++SweetAcceleratorUserClient::allocShmem(uint32_t reqSize, uint64_t *outVA, uint32_t *outSize, void **outKernelPtr)
 +{
 +	uint32_t sz = (uint32_t)round_page(reqSize > 0 ? reqSize : page_size);
 +	if (sz > (64U << 20)) {
@@ -687,7 +713,8 @@
 +	if (desc == NULL) {
 +		return 0;
 +	}
-+	bzero(desc->getBytesNoCopy(), sz);
++	void *kptr = desc->getBytesNoCopy();
++	bzero(kptr, sz);
 +	IOMemoryMap *map = desc->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapDefaultCache);
 +	if (map == NULL) {
 +		desc->release();
@@ -712,6 +739,9 @@
 +	}
 +	*outVA   = map->getAddress();
 +	*outSize = sz;
++	if (outKernelPtr != NULL) {
++		*outKernelPtr = kptr;
++	}
 +	return id;
 +}
 +
@@ -735,6 +765,7 @@
 +}
 +
 +static uint64_t sweet_gpu_sel_logged;
++static volatile SInt64 sweet_gpu_next_gid = 0x10000;
 +
 +IOReturn
 +SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -792,6 +823,16 @@
 +		memcpy(tmpOut + 0x18, &maxRes, 8);
 +		break;
 +	}
++	case 5: { /* getNextGIDGroup (IOGPUDeviceRef.c:428, out 0x10: u64 min, u64 max) */
++		uint64_t minGid = (uint64_t)OSAddAtomic64(0x10000LL, &sweet_gpu_next_gid);
++		if (minGid == 0) {
++			minGid = 0x10000ULL;
++		}
++		uint64_t maxGid = minGid + 0x10000ULL;
++		memcpy(tmpOut + 0x00, &minGid, 8);
++		memcpy(tmpOut + 0x08, &maxGid, 8);
++		break;
++	}
 +	case 6: /* setAPIProperty ("Metal") */
 +		break;
 +	case 7: { /* _IOGPUCommandQueueCreateWithQoS (out 0x10) */
@@ -805,12 +846,14 @@
 +		break;
 +	case 9: { /* _IOGPUResourceCreate (out >= 0x50) */
 +		uint32_t reqSz = (uint32_t)page_size;
++		uint64_t pinnedGpuVA = 0;
 +		uint64_t texAddr = 0;
 +		uint64_t origAddr = 0;
 +		uint32_t primarySid = 0;
 +		if (args->structureInput != NULL && args->structureInputSize >= 0x50) {
 +			const uint8_t *in = (const uint8_t *)args->structureInput;
 +			uint64_t inSz = 0;
++			memcpy(&pinnedGpuVA, in + 0x30, 8);
 +			memcpy(&texAddr, in + 0x38, 8);
 +			memcpy(&origAddr, in + 0x40, 8);
 +			memcpy(&inSz, in + 0x48, 8);
@@ -826,14 +869,6 @@
 +		uint32_t actualSz = reqSz;
 +		uint32_t sid = 0;
 +		if (texAddr != 0) {
-+			/*
-+			 * Suballocated buffer (initWithPrimaryBuffer:) or pointer-backed resource:
-+			 * +0x38 (texAddr)  = primaryBuffer->_res.virtualAddress + bufferOffset
-+			 * +0x40 (origAddr) = primaryBuffer->_res.virtualAddress
-+			 * +0x50 (u32)      = primaryBuffer->_res.resourceID
-+			 * IOGPUMetalBuffer.m:309 asserts _res.virtualAddress == texAddr.
-+			 * IOGPUMetalBuffer.m:310 asserts _res.gpuAddress == primaryGpuVA + bufferOffset.
-+			 */
 +			sid = ++fNextId;
 +			va = texAddr;
 +			uint64_t bufferOffset = (origAddr != 0 && texAddr >= origAddr) ? (texAddr - origAddr) : 0;
@@ -841,11 +876,14 @@
 +			    fShmemGpuVA[primarySid] : (origAddr != 0 ? origAddr : texAddr);
 +			gpuVA = baseGpuVA + bufferOffset;
 +		} else {
-+			sid = allocShmem(reqSz, &va, &actualSz);
++			sid = allocShmem(reqSz, &va, &actualSz, NULL);
 +			if (sid == 0) {
 +				return kIOReturnNoMemory;
 +			}
-+			gpuVA = va;
++			gpuVA = pinnedGpuVA != 0 ? pinnedGpuVA : va;
++			if (sid < SWEET_GPU_MAX_SHMEMS) {
++				fShmemGpuVA[sid] = gpuVA;
++			}
 +		}
 +		uint64_t len64 = actualSz;
 +		uint64_t sharedVA = fStatusMap != NULL ? fStatusMap->getAddress() : va;
@@ -865,11 +903,23 @@
 +		}
 +		break;
 +	}
++	case 12: { /* _IOGPUResourceSetPurgeable */
++		if (args->scalarOutputCount > 0) {
++			args->scalarOutput[0] = 2; /* kMTLPurgeableStateNonVolatile */
++		}
++		break;
++	}
 +	case 13: { /* _IOGPUDeviceCreateDeviceShmem (out 0x10: u64 addr, u32 size, u32 id) */
-+		uint32_t reqSz = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : (uint32_t)page_size;
++		uint32_t reqSz = 0x40000; /* 256 KB minimum for command buffer shmem */
++		if (args->scalarInputCount > 0 && args->scalarInput[0] > reqSz && args->scalarInput[0] <= (64ULL << 20)) {
++			reqSz = (uint32_t)args->scalarInput[0];
++		}
++		if (args->scalarInputCount > 1 && args->scalarInput[1] > reqSz && args->scalarInput[1] <= (64ULL << 20)) {
++			reqSz = (uint32_t)args->scalarInput[1];
++		}
 +		uint64_t va = 0;
 +		uint32_t actualSz = 0;
-+		uint32_t sid = allocShmem(reqSz, &va, &actualSz);
++		uint32_t sid = allocShmem(reqSz, &va, &actualSz, NULL);
 +		if (sid == 0) {
 +			return kIOReturnNoMemory;
 +		}
@@ -887,17 +937,32 @@
 +	case 15: { /* _IOGPUNotificationQueueCreate (out 0x10: u64 addr, u32 id) */
 +		uint64_t va = 0;
 +		uint32_t actualSz = 0;
-+		uint32_t qid = allocShmem((uint32_t)page_size, &va, &actualSz);
++		void *kptr = NULL;
++		uint32_t qid = allocShmem(0x10000, &va, &actualSz, &kptr);
 +		if (qid == 0) {
 +			return kIOReturnNoMemory;
++		}
++		if (kptr != NULL && actualSz > 12) {
++			*(uint32_t *)kptr = actualSz - 12; /* IODataQueueMemory::queueSize */
 +		}
 +		memcpy(tmpOut + 0x00, &va, 8);
 +		memcpy(tmpOut + 0x08, &qid, 4);
 +		break;
 +	}
 +	case 25: /* setCommandQueueNotificationQueue */
-+	case 26: /* _IOGPUCommandQueueSubmitCommandBuffers */
 +		break;
++	case 26: { /* _IOGPUCommandQueueSubmitCommandBuffers */
++		static uint32_t submit_logged;
++		if (submit_logged < 8 && args->structureInput != NULL && args->structureInputSize >= 32) {
++			submit_logged++;
++			const uint64_t *w = (const uint64_t *)args->structureInput;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET GPU: %s submit (%u bytes): 0x%llx 0x%llx 0x%llx 0x%llx\n",
++			    name, args->structureInputSize, w[0], w[1], w[2], w[3]);
++		}
++		break;
++	}
 +	case 256: { /* 0x100: AGXGPUCoreConfig (out 0x78 = 120 bytes into x20 + 0x268) */
 +		uint32_t numCores = 3;
 +		uint32_t coreMask = 0x7;
@@ -1094,7 +1159,7 @@
  
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +928,7 @@
+@@ -192,7 +971,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -1103,7 +1168,7 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +939,7 @@
+@@ -203,6 +982,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -1111,7 +1176,7 @@
  	return true;
  }
  
-@@ -210,20 +947,14 @@
+@@ -210,20 +990,14 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -1137,7 +1202,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -252,10 +983,30 @@
+@@ -252,10 +1026,30 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -1169,7 +1234,7 @@
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
  
-@@ -289,21 +1040,14 @@
+@@ -289,21 +1083,14 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -1194,7 +1259,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +1055,12 @@
+@@ -311,15 +1098,12 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -1211,7 +1276,7 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -349,6 +1090,10 @@
+@@ -349,6 +1133,10 @@
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -1222,7 +1287,7 @@
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -359,7 +1104,6 @@
+@@ -359,7 +1147,6 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -1230,7 +1295,7 @@
  		dx -= fOffX;
  		dy -= fOffY;
  		if (dx < 0) {
-@@ -384,21 +1128,42 @@
+@@ -384,21 +1171,42 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -1278,7 +1343,7 @@
  }
  
  bool
-@@ -534,7 +1299,7 @@
+@@ -534,7 +1342,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
@@ -1287,4 +1352,3 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
-
