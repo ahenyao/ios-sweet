@@ -622,9 +622,8 @@
 +	fNotifyPort = MACH_PORT_NULL;
 +	fLock = IOLockAlloc();
 +
-+	/* Allocate the status memory directly in the user task so XNU natively maps it RW */
 +	fStatusMem = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    fTask, kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
 +	if (fStatusMem != NULL) {
 +		bzero(fStatusMem->getBytesNoCopy(), page_size);
 +		fStatusMap = fStatusMem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapDefaultCache);
@@ -719,9 +718,8 @@
 +	if (sz > (64U << 20)) {
 +		sz = (64U << 20);
 +	}
-+	/* Fix 1: Allocate natively in the user task (fTask) to guarantee XNU gives it PROT_WRITE */
 +	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    fTask, kIODirectionInOut | kIOMemoryKernelUserShared, sz, page_size);
++	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, sz, page_size);
 +	if (desc == NULL) {
 +		return 0;
 +	}
@@ -830,7 +828,6 @@
 +	case 4:  /* _IOGPUDeviceGetMaxResourceSize (out 0x20) */
 +	case 22: /* _IOGPUDeviceGetMemoryData (in 0x30, out 0x30) */
 +	{
-+		/* Fix 2: Provide the full 48 bytes (0x30) for selector 22 to prevent kIOReturnBadArgument */
 +		uint64_t maxRes = 0x40000000ULL;
 +		for (int i = 0; i < 6; i++) {
 +			memcpy(tmpOut + (i * 8), &maxRes, 8);
@@ -899,16 +896,19 @@
 +				fShmemGpuVA[sid] = gpuVA;
 +			}
 +		}
++		
 +		uint64_t len64 = actualSz;
-+		uint64_t sharedVA = fStatusMap != NULL ? fStatusMap->getAddress() : va;
++		uint64_t memEntry = 0;
++		uint32_t flags = 0;
 +		uint64_t traceId = sid;
++		
 +		memcpy(tmpOut + 0x00, &gpuVA, 8);
 +		memcpy(tmpOut + 0x08, &va, 8);
 +		memcpy(tmpOut + 0x10, &len64, 8);
-+		memcpy(tmpOut + 0x1c, &sid, 4);
-+		memcpy(tmpOut + 0x20, &sharedVA, 8);
-+		memcpy(tmpOut + 0x28, &len64, 8);
-+		memcpy(tmpOut + 0x48, &traceId, 8);
++		memcpy(tmpOut + 0x18, &sid, 4);
++		memcpy(tmpOut + 0x1c, &flags, 4);
++		memcpy(tmpOut + 0x20, &memEntry, 8);
++		memcpy(tmpOut + 0x28, &traceId, 8);
 +		break;
 +	}
 +	case 10: { /* _IOGPUResourceRelease */
@@ -1366,4 +1366,3 @@
  			IOLockLock(fFB->fLock);
  			if (off != fFB->fPowerOff) {
  				fFB->fPowerOff = off;
-
