@@ -322,7 +322,7 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -70,23 +44,847 @@
+@@ -70,23 +44,850 @@
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
  #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
@@ -626,8 +626,10 @@
 +	fNextId = 512;
 +	fNotifyPort = MACH_PORT_NULL;
 +	fLock = IOLockAlloc();
-+	fStatusMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++
++	/* Use kIOMemoryShared so the user task maps it RW (PROT_READ|PROT_WRITE) */
++	fStatusMem = IOBufferMemoryDescriptor::withOptions(
++	    kIODirectionInOut | kIOMemoryShared, page_size, page_size);
 +	if (fStatusMem != NULL) {
 +		bzero(fStatusMem->getBytesNoCopy(), page_size);
 +		fStatusMap = fStatusMem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapDefaultCache);
@@ -725,8 +727,9 @@
 +	if (sz > (64U << 20)) {
 +		sz = (64U << 20);
 +	}
-+	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, sz, page_size);
++	/* Use kIOMemoryShared so the user task maps it RW (PROT_READ|PROT_WRITE) */
++	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::withOptions(
++	    kIODirectionInOut | kIOMemoryShared, sz, page_size);
 +	if (desc == NULL) {
 +		return 0;
 +	}
@@ -1178,7 +1181,7 @@
  
  class IOMobileFramebufferUserClient;
  
-@@ -192,7 +990,7 @@
+@@ -192,7 +993,7 @@
  		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
@@ -1187,7 +1190,7 @@
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
-@@ -203,6 +1001,7 @@
+@@ -203,6 +1004,7 @@
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -1195,7 +1198,7 @@
  	return true;
  }
  
-@@ -210,20 +1009,14 @@
+@@ -210,20 +1012,14 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -1221,7 +1224,7 @@
  	if (fb->fPowerOff) {
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
-@@ -252,10 +1045,30 @@
+@@ -252,10 +1048,30 @@
  		}
  	}
  	IOLockUnlock(fb->fLock);
@@ -1253,7 +1256,7 @@
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
  
-@@ -289,21 +1102,14 @@
+@@ -289,21 +1105,14 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -1278,7 +1281,7 @@
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  	}
  }
-@@ -311,15 +1117,12 @@
+@@ -311,15 +1120,12 @@
  void
  AppleCLCD::present(const uint8_t *rec)
  {
@@ -1295,7 +1298,7 @@
  			sweet_console_muted = 1;
  		}
  	}
-@@ -349,6 +1152,10 @@
+@@ -349,6 +1155,10 @@
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -1306,7 +1309,7 @@
  		if (w <= 0 || h <= 0) {
  			w = (int32_t)s->width;
  			h = (int32_t)s->height;
-@@ -359,7 +1166,6 @@
+@@ -359,7 +1169,6 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -1314,7 +1317,7 @@
  		dx -= fOffX;
  		dy -= fOffY;
  		if (dx < 0) {
-@@ -384,21 +1190,42 @@
+@@ -384,21 +1193,42 @@
  		if (h > (int32_t)fHeight - dy) {
  			h = (int32_t)fHeight - dy;
  		}
@@ -1362,7 +1365,7 @@
  }
  
  bool
-@@ -534,7 +1361,7 @@
+@@ -534,7 +1364,7 @@
  		break;
  	case kSweetFBRequestPowerChange:
  		if (args->scalarInputCount >= 1) {
