@@ -623,7 +623,7 @@
 +	fLock = IOLockAlloc();
 +
 +	fStatusMem = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    fTask, kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
++	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
 +	if (fStatusMem != NULL) {
 +		bzero(fStatusMem->getBytesNoCopy(), page_size);
 +		fStatusMap = fStatusMem->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapDefaultCache);
@@ -724,7 +724,7 @@
 +	
 +	// Allocate in the user task (fTask) instead of kernel_task
 +	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithOptions(
-+	    fTask, kIODirectionInOut | kIOMemoryKernelUserShared, sz, page_size);
++	    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, sz, page_size);
 +	if (desc == NULL) {
 +		return 0;
 +	}
